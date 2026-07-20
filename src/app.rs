@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -10,6 +11,8 @@ use ratatui::DefaultTerminal;
 use crate::commands::{self, Action};
 use crate::config::{expand_tilde, Config, CAT_COLORS};
 use crate::editor::buffer::Buffer;
+use crate::editor::complete::{self, Completion};
+use crate::editor::diagnostics::{self, CheckResult};
 use crate::ui;
 
 pub enum Screen {
@@ -100,6 +103,22 @@ pub struct Popup {
     pub scroll: usize,
 }
 
+/// The window that pops up by itself when a ▶ run fails: the
+/// program's own words, so the error is impossible to miss.
+pub struct RunReport {
+    pub code: i32,
+    pub lines: Vec<String>,
+}
+
+/// A ▶ run being watched for its exit marker in the terminal.
+struct RunWatch {
+    pane: usize,
+    tab: usize,
+    seq: u64,
+    path: PathBuf,
+    started: Instant,
+}
+
 /// One editor split. Files open here as a stack of tabs shown in the
 /// pane's tab bar; `tab` is the one currently displayed.
 pub struct Pane {
@@ -144,6 +163,10 @@ pub struct EditorState {
     pub term_seq: usize,
     /// Left pane's share of the width, in percent (20..=80).
     pub split: u16,
+    /// The suggestion popup, while it's showing.
+    pub completion: Option<Completion>,
+    /// A failed run's output, shown as a window until dismissed.
+    pub run_report: Option<RunReport>,
 }
 
 pub struct App {
@@ -175,6 +198,16 @@ pub struct App {
     /// The shortcut-keys panel: browse bindings, press enter, press
     /// the new combination. Open from home (`k`) or `keys` in the popup.
     pub keys_editor: Option<KeysEditor>,
+    /// Background error checks report back through this channel.
+    diag_tx: Sender<CheckResult>,
+    diag_rx: Receiver<CheckResult>,
+    /// True while a live (as-you-type) check is out running; the next
+    /// one waits so slow tools can't pile up.
+    live_inflight: bool,
+    /// Numbers ▶ runs so each exit marker is unmistakable.
+    run_seq: u64,
+    /// The run currently being watched for completion, if any.
+    run_watch: Option<RunWatch>,
 }
 
 pub struct KeysEditor {
@@ -204,6 +237,9 @@ pub fn command_action_help(action: &str) -> &'static str {
         "spawn" => "a real terminal tab, right here",
         "run" => "run the active file's program",
         "keys" => "open this customize panel",
+        "check" => "check the file for errors",
+        "debug" => "run, stopping at stop points",
+        "break" => "toggle a stop point here",
         _ => "",
     }
 }
@@ -224,6 +260,9 @@ pub fn key_action_help(action: &str) -> &'static str {
         "cycle_files" => "cycle / swap open files",
         "split_left" => "shrink the left pane",
         "split_right" => "grow the left pane",
+        "toggle_breakpoint" => "stop point on this line",
+        "debug_run" => "run, stopping at stop points",
+        "complete" => "suggest code at the cursor",
         _ => "",
     }
 }
@@ -354,6 +393,82 @@ fn run_command_for(path: &Path, root: &Path) -> Option<String> {
         "c" => Some(format!("cc \"{p}\" -o \"{bin}\" && \"{bin}\"")),
         "cpp" | "cc" | "cxx" => Some(format!("c++ \"{p}\" -o \"{bin}\" && \"{bin}\"")),
         "java" => Some(format!("java \"{p}\"")),
+        "dart" => {
+            let pubspec = root.join("pubspec.yaml");
+            let flutter = std::fs::read_to_string(&pubspec)
+                .map(|s| s.contains("flutter"))
+                .unwrap_or(false);
+            Some(if flutter { "flutter run".into() } else { format!("dart \"{p}\"") })
+        }
+        _ => None,
+    }
+}
+
+/// Find `__silver_exit_<seq>=<code>__` in terminal text. The echoed
+/// command line shows `%s` instead of digits, so only the printed
+/// marker (the finished run) can match. Returns (position, code).
+fn find_exit_marker(text: &str, seq: u64) -> Option<(usize, i32)> {
+    let tag = format!("__silver_exit_{seq}=");
+    let mut from = 0usize;
+    while let Some(i) = text[from..].find(&tag) {
+        let at = from + i;
+        let rest = &text[at + tag.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest[digits.len()..].starts_with("__") {
+            if let Ok(code) = digits.parse() {
+                return Some((at, code));
+            }
+        }
+        from = at + tag.len();
+    }
+    None
+}
+
+/// The binary a Cargo project builds: the first `[[bin]]` name when
+/// one is declared, else the package name.
+fn cargo_bin_name(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let val: toml::Value = toml::from_str(&text).ok()?;
+    if let Some(name) = val
+        .get("bin")
+        .and_then(|b| b.as_array())
+        .and_then(|a| a.first())
+        .and_then(|b| b.get("name"))
+        .and_then(|n| n.as_str())
+    {
+        return Some(name.to_string());
+    }
+    val.get("package")?.get("name")?.as_str().map(|s| s.to_string())
+}
+
+/// The shell command that runs a file under a debugger, stopping at
+/// the given 1-based lines. lldb ships with the compilers on macOS,
+/// pdb ships inside python — both free, nothing to install.
+fn debug_command_for(path: &Path, root: &Path, bps: &[usize]) -> Option<String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let p = path.display();
+    let fname = path.file_name().map(|n| n.to_string_lossy().to_string())?;
+    let tmp_bin = std::env::temp_dir().join("silver_debug");
+    let bin = tmp_bin.display();
+    let lldb = |target: String| {
+        let stops: String =
+            bps.iter().map(|n| format!(" -o \"b {fname}:{n}\"")).collect();
+        format!("lldb \"{target}\"{stops} -o run")
+    };
+    match ext.as_str() {
+        "rs" if root.join("Cargo.toml").exists() => {
+            let name = cargo_bin_name(root)?;
+            Some(format!("cargo build && {}", lldb(format!("target/debug/{name}"))))
+        }
+        "rs" => Some(format!("rustc -g \"{p}\" -o \"{bin}\" && {}", lldb(bin.to_string()))),
+        "c" => Some(format!("cc -g \"{p}\" -o \"{bin}\" && {}", lldb(bin.to_string()))),
+        "cpp" | "cc" | "cxx" => {
+            Some(format!("c++ -g \"{p}\" -o \"{bin}\" && {}", lldb(bin.to_string())))
+        }
+        "py" => {
+            let stops: String = bps.iter().map(|n| format!(" -c \"b {n}\"")).collect();
+            Some(format!("python3 -m pdb{stops} -c c \"{p}\""))
+        }
         _ => None,
     }
 }
@@ -388,6 +503,7 @@ pub fn copy_to_clipboard(text: &str) -> bool {
 
 impl App {
     pub fn new() -> Self {
+        let (tx, rx) = channel();
         Self {
             config: Config::load(),
             screen: Screen::Home,
@@ -406,6 +522,11 @@ impl App {
             hover: None,
             media: crate::media::MediaWatch::start(),
             keys_editor: None,
+            diag_tx: tx,
+            diag_rx: rx,
+            live_inflight: false,
+            run_seq: 0,
+            run_watch: None,
         }
     }
 
@@ -451,6 +572,13 @@ impl App {
             return;
         }
         if let Screen::Editor = self.screen {
+            // A click anywhere dismisses the run-failure window.
+            if self.editor.as_ref().map(|e| e.run_report.is_some()).unwrap_or(false) {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.run_report = None;
+                }
+                return;
+            }
             // The popup terminal grabs all input while open.
             if self.editor.as_ref().map(|e| e.popup.is_some()).unwrap_or(false) {
                 return;
@@ -833,6 +961,7 @@ impl App {
         }
         let mut msg = None;
         let mut retrieve = None;
+        let mut newly_opened = false;
         if let Some(ed) = self.editor.as_mut() {
             ed.place = None;
             ed.files = None;
@@ -860,6 +989,7 @@ impl App {
                         p.tabs.push(buf);
                         p.tab = p.tabs.len() - 1;
                         ed.active = dst;
+                        newly_opened = true;
                         msg = Some(format!(
                             "showing {name} on the {}",
                             if dst == 0 { "left" } else { "right" }
@@ -871,6 +1001,12 @@ impl App {
         }
         if let Some((pi, ti, d)) = retrieve {
             self.move_tab(pi, ti, d);
+        }
+        // A fresh file gets a quiet first check, so a broken file is
+        // already marked up the moment it appears.
+        if newly_opened {
+            let root = self.editor.as_ref().map(|e| e.root.clone()).unwrap_or_default();
+            let _ = diagnostics::spawn_check(&canon, &root, true, self.diag_tx.clone());
         }
         if let Some(m) = msg {
             self.toast(m);
@@ -931,6 +1067,133 @@ impl App {
             return;
         };
         let (pi, ti) = self.ensure_terminal();
+        // The command runs with an exit marker appended, so the app
+        // hears about failures and can pop the error up by itself.
+        self.run_seq += 1;
+        let seq = self.run_seq;
+        let wrapped = if cfg!(windows) {
+            cmd.clone()
+        } else {
+            format!("{cmd}; printf '\\n__silver_exit_{seq}=%s__\\n' \"$?\"")
+        };
+        if let Some(ed) = self.editor.as_mut() {
+            ed.run_report = None;
+            if let Some(pane) = ed.panes.get_mut(pi) {
+                pane.tab = ti;
+                if let Some(t) = pane.tabs.get_mut(ti).and_then(|b| b.term.as_mut()) {
+                    if t.is_running() {
+                        t.interrupt();
+                    }
+                    t.exec(&wrapped);
+                }
+            }
+        }
+        self.run_watch = if cfg!(windows) {
+            None
+        } else {
+            Some(RunWatch { pane: pi, tab: ti, seq, path, started: Instant::now() })
+        };
+        self.toast(format!("running: {cmd}"));
+    }
+
+    /// Recompute the suggestion popup from the word at the cursor.
+    /// `manual` (the complete key) opens from the first letter; while
+    /// typing it waits for two, so it doesn't flicker on every key.
+    pub fn refresh_completion(&mut self, manual: bool) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        let Some(buf) = ed.panes.get(ed.active).and_then(|p| p.buf()) else {
+            ed.completion = None;
+            return;
+        };
+        if buf.term.is_some() {
+            ed.completion = None;
+            return;
+        }
+        let line = buf.lines.get(buf.cy).map(String::as_str).unwrap_or("");
+        let prefix = complete::word_prefix(line, buf.cx);
+        let min = if manual { 1 } else { 2 };
+        if prefix.chars().count() < min {
+            ed.completion = None;
+            return;
+        }
+        let items = complete::suggestions(&buf.lines, &buf.ext(), &prefix);
+        ed.completion = if items.is_empty() {
+            None
+        } else {
+            Some(Completion { items, selected: 0, prefix })
+        };
+    }
+
+    /// Insert the rest of the picked suggestion at the cursor.
+    fn accept_completion(&mut self) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        let Some(c) = ed.completion.take() else { return };
+        let Some(item) = c.items.get(c.selected) else { return };
+        let rest: String = item.chars().skip(c.prefix.chars().count()).collect();
+        if let Some(buf) = ed.panes.get_mut(ed.active).and_then(|p| p.buf_mut()) {
+            for ch in rest.chars() {
+                buf.insert_char(ch);
+            }
+            buf.ensure_visible();
+        }
+    }
+
+    /// Toggle a stop point on the cursor's line.
+    pub fn toggle_breakpoint(&mut self) {
+        let debug_key = self.config.keys.get("debug_run").cloned().unwrap_or_default();
+        let mut msg = None;
+        if let Some(ed) = self.editor.as_mut() {
+            if let Some(buf) = ed.panes.get_mut(ed.active).and_then(|p| p.buf_mut()) {
+                if buf.term.is_some() {
+                    msg = Some("stop points live in files, not terminals".to_string());
+                } else {
+                    let y = buf.cy;
+                    let n = y + 1;
+                    msg = Some(if buf.toggle_breakpoint(y) {
+                        format!("● stop point at line {n} — {debug_key} runs to it")
+                    } else {
+                        format!("stop point at line {n} removed")
+                    });
+                }
+            }
+        }
+        if let Some(m) = msg {
+            self.toast(m);
+        }
+    }
+
+    /// Run the active file under a real debugger (lldb / pdb) with
+    /// every stop point pre-set, in a terminal tab like ▶ run.
+    pub fn debug_current_file(&mut self) {
+        let bp_key = self.config.keys.get("toggle_breakpoint").cloned().unwrap_or_default();
+        let info = {
+            let Some(ed) = self.editor.as_ref() else { return };
+            ed.panes
+                .get(ed.active)
+                .and_then(|p| p.buf())
+                .filter(|b| b.term.is_none())
+                .map(|b| {
+                    let bps: Vec<usize> = b.breakpoints.iter().map(|l| l + 1).collect();
+                    (b.path.clone(), bps, b.dirty)
+                })
+        };
+        let Some((path, bps, dirty)) = info else {
+            self.toast("nothing to debug here — open a file first");
+            return;
+        };
+        if bps.is_empty() {
+            self.toast(format!("no stop points yet — press {bp_key} on a line first"));
+            return;
+        }
+        if dirty {
+            self.save_active();
+        }
+        let root = self.editor.as_ref().map(|e| e.root.clone()).unwrap_or_default();
+        let Some(cmd) = debug_command_for(&path, &root, &bps) else {
+            self.toast("debug run knows rust, c/c++ and python — use ▶ run for the rest");
+            return;
+        };
+        let (pi, ti) = self.ensure_terminal();
         if let Some(ed) = self.editor.as_mut() {
             if let Some(pane) = ed.panes.get_mut(pi) {
                 pane.tab = ti;
@@ -942,7 +1205,37 @@ impl App {
                 }
             }
         }
-        self.toast(format!("running: {cmd}"));
+        self.toast(format!(
+            "stopping at {} point(s) — in the terminal: c continues, n steps",
+            bps.len()
+        ));
+    }
+
+    /// Check the active file for errors right now (also saves it, so
+    /// the checker sees what's on screen).
+    pub fn check_active(&mut self) {
+        let info = {
+            let Some(ed) = self.editor.as_ref() else { return };
+            ed.panes
+                .get(ed.active)
+                .and_then(|p| p.buf())
+                .filter(|b| b.term.is_none())
+                .map(|b| (b.path.clone(), b.ext(), b.dirty, b.name()))
+        };
+        let Some((path, ext, dirty, name)) = info else {
+            self.toast("nothing to check here — open a file first");
+            return;
+        };
+        if dirty {
+            self.save_active(); // save_active already spawns the check
+            return;
+        }
+        let root = self.editor.as_ref().map(|e| e.root.clone()).unwrap_or_default();
+        if diagnostics::spawn_check(&path, &root, false, self.diag_tx.clone()) {
+            self.toast(format!("checking {name}…"));
+        } else {
+            self.toast(format!("no checker for .{ext} files yet"));
+        }
     }
 
     /// A terminal to run things in: the first one already open, or a
@@ -1150,6 +1443,147 @@ impl App {
         if let Some((_, at)) = &self.toast {
             if at.elapsed() > Duration::from_secs(3) {
                 self.toast = None;
+            }
+        }
+        // Finished background checks: hand each file its problems.
+        let mut results = Vec::new();
+        while let Ok(r) = self.diag_rx.try_recv() {
+            results.push(r);
+        }
+        for r in results {
+            if r.quiet {
+                self.live_inflight = false;
+            }
+            let name = r
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(msg) = r.failed {
+                if !r.quiet {
+                    self.toast(format!("couldn't check {name}: {msg}"));
+                }
+                continue;
+            }
+            let errors = r.diags.iter().filter(|d| !d.warning).count();
+            let warnings = r.diags.len() - errors;
+            if let Some(ed) = self.editor.as_mut() {
+                for pane in &mut ed.panes {
+                    for buf in &mut pane.tabs {
+                        if buf.term.is_none() && buf.path == r.path {
+                            // A live check of text that has changed
+                            // since would mark the wrong lines.
+                            if r.quiet && buf.rev != r.rev {
+                                continue;
+                            }
+                            buf.diags = r.diags.clone();
+                        }
+                    }
+                }
+            }
+            // Live checks stay silent; saves and `check` get a verdict.
+            if !r.quiet {
+                self.toast(match (errors, warnings, r.others) {
+                    (0, 0, 0) => format!("✓ {name}: no problems found"),
+                    (0, 0, o) => {
+                        format!("{name} is fine, but {o} error(s) live in other project files")
+                    }
+                    (0, w, _) => format!("{name}: {w} warning(s) — marked in the gutter"),
+                    (e, 0, 0) => format!("✗ {name}: {e} error(s) — the red lines show where"),
+                    (e, w, 0) => format!("✗ {name}: {e} error(s), {w} warning(s)"),
+                    (e, _, o) => format!("✗ {name}: {e} error(s) here, {o} more elsewhere"),
+                });
+            }
+        }
+
+        // A ▶ run in flight: watch the terminal for its exit marker.
+        // A failed program pops its own words up as a window, and any
+        // `file:line` spots it names turn red in the editor.
+        if let Some(w) = self.run_watch.as_ref() {
+            if w.started.elapsed() > Duration::from_secs(900) {
+                self.run_watch = None;
+            }
+        }
+        let mut finished: Option<(i32, Vec<String>, PathBuf)> = None;
+        if let Some(w) = self.run_watch.as_ref() {
+            let (pane, tab, seq) = (w.pane, w.tab, w.seq);
+            let path = w.path.clone();
+            let text = self
+                .editor
+                .as_mut()
+                .and_then(|ed| ed.panes.get_mut(pane))
+                .and_then(|p| p.tabs.get_mut(tab))
+                .and_then(|b| b.term.as_mut())
+                .map(|t| t.live_text());
+            match text {
+                None => self.run_watch = None, // that terminal is gone
+                Some(text) => {
+                    if let Some((pos, code)) = find_exit_marker(&text, seq) {
+                        self.run_watch = None;
+                        if code != 0 {
+                            let mut lines: Vec<String> = text[..pos]
+                                .lines()
+                                .rev()
+                                .filter(|l| {
+                                    !l.trim().is_empty() && !l.contains("__silver_exit_")
+                                })
+                                .take(18)
+                                .map(|l| l.trim_end().to_string())
+                                .collect();
+                            lines.reverse();
+                            finished = Some((code, lines, path));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((code, lines, path)) = finished {
+            let fname =
+                path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let found = diagnostics::parse_output(&lines.join("\n"), &fname);
+            if let Some(ed) = self.editor.as_mut() {
+                for pane in &mut ed.panes {
+                    for buf in &mut pane.tabs {
+                        if buf.term.is_none() && buf.path == path {
+                            for d in &found {
+                                if !buf
+                                    .diags
+                                    .iter()
+                                    .any(|e| e.line == d.line && e.message == d.message)
+                                {
+                                    buf.diags.push(d.clone());
+                                }
+                            }
+                            buf.diags.sort_by(|a, b| a.line.cmp(&b.line));
+                        }
+                    }
+                }
+                ed.run_report = Some(RunReport { code, lines });
+            }
+            self.toast(format!("the program stopped with error code {code}"));
+        }
+
+        // A pause in typing re-checks the active file from a snapshot
+        // of the unsaved buffer — errors show up without saving.
+        let mut live: Option<(String, PathBuf, PathBuf, u64)> = None;
+        if !self.live_inflight {
+            if let Some(ed) = self.editor.as_mut() {
+                let root = ed.root.clone();
+                if let Some(buf) = ed.panes.get_mut(ed.active).and_then(|p| p.buf_mut()) {
+                    let paused = buf
+                        .edited_at
+                        .map(|t| t.elapsed() > Duration::from_millis(1100))
+                        .unwrap_or(false);
+                    if buf.term.is_none() && paused && buf.rev != buf.checked_rev {
+                        buf.checked_rev = buf.rev;
+                        live = Some((buf.lines.join("\n"), buf.path.clone(), root, buf.rev));
+                    }
+                }
+            }
+        }
+        if let Some((content, path, root, rev)) = live {
+            if diagnostics::spawn_snapshot(content, &path, &root, rev, self.diag_tx.clone()) {
+                self.live_inflight = true;
             }
         }
     }
@@ -1676,6 +2110,8 @@ impl App {
             pending_path: None,
             term_seq: 0,
             split: 50,
+            completion: None,
+            run_report: None,
         });
         self.screen = Screen::Editor;
         self.toast("project opened — Ctrl+T then `ls` to browse files");
@@ -1734,6 +2170,18 @@ impl App {
             self.switch_next();
             return;
         }
+        if self.config.key_is("toggle_breakpoint", &k) {
+            self.toggle_breakpoint();
+            return;
+        }
+        if self.config.key_is("debug_run", &k) {
+            self.debug_current_file();
+            return;
+        }
+        if self.config.key_is("complete", &k) {
+            self.refresh_completion(true);
+            return;
+        }
         if self.config.key_is("split_left", &k) {
             self.adjust_split(-5);
             return;
@@ -1775,6 +2223,17 @@ impl App {
 
         let Some(ed) = self.editor.as_mut() else { return };
 
+        // The run-failure window sits on top: any dismiss key closes it.
+        if ed.run_report.is_some() {
+            if matches!(
+                k.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('q')
+            ) {
+                ed.run_report = None;
+            }
+            return;
+        }
+
         // The switcher grabs navigation while open.
         if ed.switcher.is_some() {
             self.on_key_switcher(k);
@@ -1799,6 +2258,45 @@ impl App {
         if ed.location.is_some() {
             self.on_key_location(k);
             return;
+        }
+
+        // The suggestion popup reacts first while it's showing (only
+        // file tabs ever have one).
+        let active_is_file = ed
+            .panes
+            .get(ed.active)
+            .and_then(|p| p.buf())
+            .map(|b| b.term.is_none())
+            .unwrap_or(false);
+        if !active_is_file {
+            ed.completion = None;
+        }
+        if ed.completion.is_some() {
+            match k.code {
+                KeyCode::Esc => {
+                    ed.completion = None;
+                    return;
+                }
+                KeyCode::Up => {
+                    if let Some(c) = ed.completion.as_mut() {
+                        let n = c.items.len().max(1);
+                        c.selected = (c.selected + n - 1) % n;
+                    }
+                    return;
+                }
+                KeyCode::Down => {
+                    if let Some(c) = ed.completion.as_mut() {
+                        let n = c.items.len().max(1);
+                        c.selected = (c.selected + 1) % n;
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.accept_completion();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // Plain editing.
@@ -1854,20 +2352,43 @@ impl App {
             _ => {}
         }
         buf.ensure_visible();
+        // Typing refreshes the suggestions; anything else closes them.
+        match k.code {
+            KeyCode::Char(_) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.refresh_completion(false)
+            }
+            KeyCode::Backspace => self.refresh_completion(false),
+            _ => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.completion = None;
+                }
+            }
+        }
     }
 
     fn save_active(&mut self) {
         let mut msg = None;
+        let mut check: Option<(PathBuf, PathBuf)> = None;
         if let Some(ed) = self.editor.as_mut() {
+            let root = ed.root.clone();
             if let Some(buf) = ed.panes.get_mut(ed.active).and_then(|p| p.buf_mut()) {
                 msg = Some(if buf.term.is_some() {
                     "a terminal has nothing to save".into()
                 } else {
                     match buf.save() {
-                        Ok(()) => format!("saved {}", buf.name()),
+                        Ok(()) => {
+                            check = Some((buf.path.clone(), root));
+                            format!("saved {}", buf.name())
+                        }
                         Err(e) => format!("save failed: {e}"),
                     }
                 });
+            }
+        }
+        // Every save re-checks the file for errors.
+        if let Some((path, root)) = check {
+            if diagnostics::spawn_check(&path, &root, false, self.diag_tx.clone()) {
+                msg = msg.map(|m| format!("{m} — checking for problems…"));
             }
         }
         if let Some(m) = msg {
@@ -2027,6 +2548,24 @@ impl App {
                     ed.popup = None;
                 }
                 self.open_keys_editor();
+            }
+            Action::Check => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.popup = None;
+                }
+                self.check_active();
+            }
+            Action::Debug => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.popup = None;
+                }
+                self.debug_current_file();
+            }
+            Action::BreakToggle => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.popup = None;
+                }
+                self.toggle_breakpoint();
             }
             Action::Unknown(msg) => self.popup_println(format!("  {msg}")),
         }
@@ -2219,6 +2758,8 @@ impl App {
             pending_path: None,
             term_seq: 0,
             split: 50,
+            completion: None,
+            run_report: None,
         });
         app
     }
@@ -2237,6 +2778,7 @@ impl App {
             return;
         }
         let mut opened = None;
+        let mut newly_opened = false;
         if let Some(ed) = self.editor.as_mut() {
             if ed.panes.is_empty() {
                 ed.panes.push(Pane::new());
@@ -2263,11 +2805,18 @@ impl App {
                         ed.popup = None;
                         ed.files = None;
                         ed.location = None;
+                        newly_opened = true;
                         opened = Some(format!("opened {name}"));
                     }
                     Err(e) => opened = Some(format!("open failed: {e}")),
                 }
             }
+        }
+        // A fresh file gets a quiet first check, so a broken file is
+        // already marked up the moment it appears.
+        if newly_opened {
+            let root = self.editor.as_ref().map(|e| e.root.clone()).unwrap_or_default();
+            let _ = diagnostics::spawn_check(&canon, &root, true, self.diag_tx.clone());
         }
         if let Some(msg) = opened {
             self.toast(msg);
@@ -2284,6 +2833,150 @@ mod tests {
     fn draw_once(app: &mut App) {
         let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
         term.draw(|f| crate::ui::draw(f, app)).unwrap();
+    }
+
+    #[test]
+    fn exit_marker_ignores_the_echoed_command() {
+        // The shell echoes the typed command (with a literal %s) before
+        // the real marker is printed with the actual exit code.
+        let text = "» dart main.dart; printf '\\n__silver_exit_3=%s__\\n' \"$?\"\nUnhandled exception:\n\n__silver_exit_3=255__\n» ";
+        let (pos, code) = find_exit_marker(text, 3).expect("marker found");
+        assert_eq!(code, 255);
+        assert!(text[..pos].contains("Unhandled exception"));
+        // Still running: only the echo is on screen — no match.
+        let running = "» dart main.dart; printf '\\n__silver_exit_4=%s__\\n' \"$?\"\nworking...\n";
+        assert!(find_exit_marker(running, 4).is_none());
+        // A stale marker from run 3 never satisfies run 4.
+        assert!(find_exit_marker(text, 4).is_none());
+    }
+
+    #[test]
+    fn failed_run_report_shows_and_dismisses() {
+        let dir = std::env::temp_dir().join("silver_report_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.dart");
+        std::fs::write(&file, "void main() {\n  print('hi');\n}\n").unwrap();
+        let buf = Buffer::open(&file).unwrap();
+        let mut app = App::test_editor(dir, vec![buf]);
+
+        app.editor.as_mut().unwrap().run_report = Some(RunReport {
+            code: 255,
+            lines: vec!["Unhandled exception:".into(), "RangeError: oops".into()],
+        });
+        draw_once(&mut app); // the window renders without panicking
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.editor.as_ref().unwrap().run_report.is_none());
+    }
+
+    #[test]
+    fn typing_pause_marks_errors_without_saving() {
+        let dir = std::env::temp_dir().join("silver_live_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("live.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+
+        let buf = Buffer::open(&file).unwrap();
+        let mut app = App::test_editor(dir, vec![buf]);
+
+        // Type a syntax error; never press save.
+        for c in "def f(:".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        // Pretend the typing pause already happened.
+        {
+            let ed = app.editor.as_mut().unwrap();
+            let b = ed.panes[0].buf_mut().unwrap();
+            b.edited_at = Some(Instant::now() - Duration::from_secs(2));
+        }
+        // Pump the tick loop until the live check reports back.
+        let mut marked = false;
+        for _ in 0..200 {
+            app.tick_update();
+            let ed = app.editor.as_ref().unwrap();
+            let b = ed.panes[0].buf().unwrap();
+            if !b.diags.is_empty() {
+                marked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marked, "no error marks arrived while the file stayed unsaved");
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.panes[0].buf().unwrap().dirty, "the live check must not save the file");
+
+        // Fixing the line clears its mark immediately.
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        let ed = app.editor.as_ref().unwrap();
+        assert!(
+            ed.panes[0].buf().unwrap().diags.iter().all(|d| d.line != 0),
+            "editing a marked line must clear its mark"
+        );
+    }
+
+    #[test]
+    fn suggestions_breakpoints_and_diagnostics_flow() {
+        let dir = std::env::temp_dir().join("silver_ide_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.rs");
+        std::fs::write(&file, "fn counter() {}\n\n").unwrap();
+
+        let buf = Buffer::open(&file).unwrap();
+        let mut app = App::test_editor(dir, vec![buf]);
+
+        // Move to the empty line and type a prefix: the popup appears.
+        {
+            let ed = app.editor.as_mut().unwrap();
+            let b = ed.panes[0].buf_mut().unwrap();
+            b.cy = 1;
+        }
+        for c in ['c', 'o'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        let items = app.editor.as_ref().unwrap().completion.as_ref().unwrap().items.clone();
+        assert!(items.contains(&"counter".to_string()));
+
+        // Down to `counter` (keywords come first), Tab accepts it.
+        let idx = items.iter().position(|s| s == "counter").unwrap();
+        for _ in 0..idx {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        {
+            let ed = app.editor.as_ref().unwrap();
+            assert_eq!(ed.panes[0].buf().unwrap().lines[1], "counter");
+            assert!(ed.completion.is_none());
+        }
+
+        // The popup draws without touching the cursor's own cell.
+        app.refresh_completion(true);
+        draw_once(&mut app);
+
+        // ctrl+p toggles a stop point on the cursor's line.
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.editor.as_ref().unwrap().panes[0].buf().unwrap().breakpoints.contains(&1));
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.editor.as_ref().unwrap().panes[0].buf().unwrap().breakpoints.is_empty());
+
+        // A finished check lands its problems in the right buffer.
+        let path = app.editor.as_ref().unwrap().panes[0].buf().unwrap().path.clone();
+        app.diag_tx
+            .send(CheckResult {
+                path,
+                diags: vec![crate::editor::diagnostics::Diagnostic {
+                    line: 0,
+                    message: "error: test problem".into(),
+                    warning: false,
+                }],
+                failed: None,
+                quiet: false,
+                rev: 0,
+                others: 0,
+            })
+            .unwrap();
+        app.tick_update();
+        assert_eq!(app.editor.as_ref().unwrap().panes[0].buf().unwrap().diags.len(), 1);
+        // And the marked-up editor still renders.
+        draw_once(&mut app);
     }
 
     #[test]

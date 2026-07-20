@@ -72,6 +72,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 || e.place.is_some()
                 || e.popup.is_some()
                 || e.switcher.is_some()
+                || e.run_report.is_some()
         })
         .unwrap_or(false);
     if window_open {
@@ -91,6 +92,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.editor.as_ref().map(|e| e.switcher.is_some()).unwrap_or(false) {
         draw_switcher(f, app);
+    }
+    if app.editor.as_ref().map(|e| e.run_report.is_some()).unwrap_or(false) {
+        draw_run_report(f, app);
     }
 
     // ---- footer ----
@@ -168,6 +172,25 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     file_spans.push(Span::styled(name, Style::new().fg(Color::White).add_modifier(Modifier::BOLD)));
     if !ext.is_empty() {
         file_spans.push(Span::styled(format!("  ·{ext}"), Style::new().fg(dim)));
+    }
+    // Problem counts from the last check, right by the name.
+    let (errs, warns) = shown
+        .map(|b| {
+            let e = b.diags.iter().filter(|d| !d.warning).count();
+            (e, b.diags.len() - e)
+        })
+        .unwrap_or((0, 0));
+    if errs > 0 {
+        file_spans.push(Span::styled(
+            format!("  ✗{errs}"),
+            Style::new().fg(Color::Rgb(235, 110, 110)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if warns > 0 {
+        file_spans.push(Span::styled(
+            format!("  !{warns}"),
+            Style::new().fg(Color::Rgb(229, 192, 92)),
+        ));
     }
     if is_file {
         let used: u16 = file_spans.iter().map(|s| s.content.chars().count() as u16).sum();
@@ -289,6 +312,8 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
     app.pane_areas = pane_areas.clone();
 
     let mut pane_targets: Vec<crate::app::MouseTarget> = Vec::new();
+    // The active pane's cursor cell, for hanging the suggestion popup.
+    let mut comp_anchor: Option<(u16, u16)> = None;
     let ed = app.editor.as_mut().unwrap();
     let can_split = n_panes == 1 && ed.panes[0].tabs.len() > 1;
     for (i, (pane, pane_area)) in ed.panes.iter_mut().zip(pane_areas.iter()).enumerate() {
@@ -316,12 +341,24 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
             continue;
         }
         let [gutter_a, text_a] =
-            Layout::horizontal([Constraint::Length(5), Constraint::Min(1)]).areas(inner);
+            Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).areas(inner);
         pane_targets.push(crate::app::MouseTarget::EditorPane { pane: i, area: text_a });
 
         buf.view_h = text_a.height as usize;
         buf.view_w = text_a.width as usize;
         buf.ensure_visible();
+
+        // line -> is-warning; errors win when a line has both.
+        let mut diag_lines: std::collections::BTreeMap<usize, bool> =
+            std::collections::BTreeMap::new();
+        for d in &buf.diags {
+            let e = diag_lines.entry(d.line).or_insert(d.warning);
+            if !d.warning {
+                *e = false;
+            }
+        }
+        let err_fg = Color::Rgb(235, 110, 110);
+        let warn_fg = Color::Rgb(229, 192, 92);
 
         let h = text_a.height as usize;
         let ext = buf.ext();
@@ -330,7 +367,7 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
         for row in 0..h {
             let idx = buf.scroll + row;
             if idx >= buf.lines.len() {
-                gutter_lines.push(Line::from(Span::styled("   ~", Style::new().fg(dim))));
+                gutter_lines.push(Line::from(Span::styled("    ~", Style::new().fg(dim))));
                 text_lines.push(Line::from(""));
                 continue;
             }
@@ -339,8 +376,30 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::new().fg(dim)
             };
-            gutter_lines.push(Line::from(Span::styled(format!("{:>4}", idx + 1), num_style)));
-            text_lines.push(highlight_line(&buf.lines[idx], &ext));
+            // Marker column: ● stop point, ✗/! a problem on that line.
+            let marker = if buf.breakpoints.contains(&idx) {
+                Span::styled("●", Style::new().fg(err_fg))
+            } else {
+                match diag_lines.get(&idx) {
+                    Some(true) => Span::styled("!", Style::new().fg(warn_fg)),
+                    Some(false) => Span::styled("✗", Style::new().fg(err_fg)),
+                    None => Span::raw(" "),
+                }
+            };
+            gutter_lines.push(Line::from(vec![
+                marker,
+                Span::styled(format!("{:>4}", idx + 1), num_style),
+            ]));
+            let mut line = highlight_line(&buf.lines[idx], &ext);
+            // Problem lines get a colored wash under the syntax colors.
+            if let Some(warning) = diag_lines.get(&idx) {
+                let wash =
+                    if *warning { Color::Rgb(56, 48, 18) } else { Color::Rgb(64, 24, 24) };
+                for s in &mut line.spans {
+                    s.style = s.style.bg(wash);
+                }
+            }
+            text_lines.push(line);
         }
         f.render_widget(Paragraph::new(gutter_lines), gutter_a);
         f.render_widget(
@@ -348,14 +407,73 @@ fn draw_panes(f: &mut Frame, app: &mut App, area: Rect) {
             text_a,
         );
 
+        // The cursor line's problem, spelled out along the pane's edge.
+        if is_active && text_a.height >= 2 {
+            if let Some(d) = buf.diags.iter().find(|d| d.line == buf.cy) {
+                let on_last_row =
+                    buf.cy.saturating_sub(buf.scroll) as u16 == text_a.height - 1;
+                let bar = Rect {
+                    x: text_a.x,
+                    y: if on_last_row { text_a.y } else { text_a.bottom() - 1 },
+                    width: text_a.width,
+                    height: 1,
+                };
+                let fg = if d.warning { warn_fg } else { err_fg };
+                let text: String = format!(" {} line {}: {} ", if d.warning { "!" } else { "✗" }, d.line + 1, d.message)
+                    .chars()
+                    .take(bar.width as usize)
+                    .collect();
+                f.render_widget(Clear, bar);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        text,
+                        Style::new().fg(fg).bg(Color::Rgb(34, 20, 20)),
+                    )),
+                    bar,
+                );
+            }
+        }
+
         if is_active && !popup_open && !overlay_open {
             let cx = (buf.cx - buf.hscroll.min(buf.cx)) as u16;
             let cy = (buf.cy - buf.scroll.min(buf.cy)) as u16;
             if cx < text_a.width && cy < text_a.height {
                 f.set_cursor_position((text_a.x + cx, text_a.y + cy));
+                comp_anchor = Some((text_a.x + cx, text_a.y + cy));
             }
         }
     }
+    // The suggestion popup, floating at the cursor.
+    if let (Some((ax, ay)), Some(comp)) = (comp_anchor, ed.completion.as_ref()) {
+        let maxw = comp.items.iter().map(|s| s.chars().count()).max().unwrap_or(0) as u16;
+        let w = (maxw + 4).clamp(18, 44).min(area.width);
+        let h = (comp.items.len() as u16 + 2).min(area.height);
+        let y = if ay + 1 + h <= area.bottom() { ay + 1 } else { ay.saturating_sub(h) };
+        let x = ax.min(area.right().saturating_sub(w)).max(area.x);
+        let rect = Rect { x, y: y.max(area.y), width: w, height: h };
+        f.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .border_style(Style::new().fg(accent))
+            .title(Span::styled(" ✦ ideas ", Style::new().fg(accent).add_modifier(Modifier::BOLD)))
+            .title_bottom(Span::styled(" tab picks · esc ", Style::new().fg(dim)));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let lines: Vec<Line> = comp
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ci, item)| {
+                let style = if ci == comp.selected {
+                    Style::new().fg(Color::Black).bg(accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(Color::Rgb(210, 210, 210))
+                };
+                Line::from(Span::styled(format!(" {item} "), style))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     // While dragging over a lone pane, mark the right half as the split target.
     if dragging && can_split {
         let a = pane_areas[0];
@@ -879,6 +997,59 @@ fn draw_switcher(f: &mut Frame, app: &mut App) {
         );
     }
     app.mouse_targets.extend(targets);
+}
+
+/// The window that appears by itself when a ▶ run fails: the tail of
+/// what the program printed, error lines in red, on top of everything.
+fn draw_run_report(f: &mut Frame, app: &App) {
+    let dim = app.config.dim();
+    let Some(ed) = app.editor.as_ref() else { return };
+    let Some(rep) = ed.run_report.as_ref() else { return };
+    let red = Color::Rgb(235, 110, 110);
+
+    let area = f.area();
+    let w = (area.width * 3 / 4).clamp(30, 96).min(area.width);
+    let h = (rep.lines.len() as u16 + 4).clamp(7, (area.height * 2 / 3).max(7)).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(red))
+        .title(Span::styled(
+            format!(" ▶ the program failed — exit code {} ", rep.code),
+            Style::new().fg(red).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " esc closes · the bad lines are marked red in your file ",
+            Style::new().fg(dim),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let show = inner.height as usize;
+    let start = rep.lines.len().saturating_sub(show);
+    let lines: Vec<Line> = rep.lines[start..]
+        .iter()
+        .map(|l| {
+            let hot = ["error", "Error", "panicked", "Exception", "Traceback", "warning"]
+                .iter()
+                .any(|k| l.contains(k));
+            let style = if hot {
+                Style::new().fg(red)
+            } else {
+                Style::new().fg(Color::Rgb(210, 210, 210))
+            };
+            Line::from(Span::styled(format!(" {l}"), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_popup_terminal(f: &mut Frame, app: &App) {

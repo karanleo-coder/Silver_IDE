@@ -1,0 +1,57 @@
+# Builds silver for macOS, Linux, and Windows and attaches the
+# binaries to a GitHub Release, so people can download the app
+# without installing Rust.
+#
+# To publish a release:   git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: silver-macos-arm64
+            bin: silver_kb
+          - os: ubuntu-latest
+            name: silver-linux-x86_64
+            bin: silver_kb
+          - os: windows-latest
+            name: silver-windows-x86_64
+            bin: silver_kb.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: linux window libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libx11-dev libgl1-mesa-dev
+
+      - name: build
+        run: cargo build --release
+
+      - name: package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: tar -C target/release -czf ${{ matrix.name }}.tar.gz ${{ matrix.bin }}
+
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/${{ matrix.bin }} -DestinationPath ${{ matrix.name }}.zip
+
+      - name: attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.zip

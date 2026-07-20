@@ -143,6 +143,17 @@ impl TermSession {
         }
     }
 
+    /// The live screen as plain text (ignores the user's scrollback
+    /// position and puts it back), for spotting a finished run.
+    pub fn live_text(&mut self) -> String {
+        let Ok(mut p) = self.parser.lock() else { return String::new() };
+        let keep = p.screen().scrollback();
+        p.set_scrollback(0);
+        let text = p.screen().contents();
+        p.set_scrollback(keep);
+        text
+    }
+
     /// Look at the screen, scrolled back by `self.scroll` rows.
     pub fn with_screen<R>(&mut self, f: impl FnOnce(&vt100::Screen) -> R) -> Option<R> {
         let mut p = self.parser.lock().ok()?;

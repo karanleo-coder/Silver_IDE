@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::diagnostics::Diagnostic;
 use super::term::TermSession;
 
 /// A single open tab: a file, or a terminal session when `term` is
@@ -22,6 +24,17 @@ pub struct Buffer {
     pub view_h: usize,
     /// Set when this tab is a terminal instead of a file.
     pub term: Option<TermSession>,
+    /// Lines (0-based) where a debug run should stop the program.
+    pub breakpoints: BTreeSet<usize>,
+    /// Problems the last check found, from the background checker.
+    pub diags: Vec<Diagnostic>,
+    /// Bumped on every edit; live checks tag results with the revision
+    /// they saw so stale ones can be dropped.
+    pub rev: u64,
+    /// The revision the last live check was started against.
+    pub checked_rev: u64,
+    /// When the last edit happened, for the typing-pause debounce.
+    pub edited_at: Option<std::time::Instant>,
 }
 
 fn byte_idx(line: &str, cx: usize) -> usize {
@@ -46,6 +59,11 @@ impl Buffer {
             view_w: 80,
             view_h: 24,
             term: None,
+            breakpoints: BTreeSet::new(),
+            diags: Vec::new(),
+            rev: 0,
+            checked_rev: 0,
+            edited_at: None,
         })
     }
 
@@ -63,6 +81,61 @@ impl Buffer {
             view_w: 80,
             view_h: 24,
             term: Some(TermSession::new(id, cwd)),
+            breakpoints: BTreeSet::new(),
+            diags: Vec::new(),
+            rev: 0,
+            checked_rev: 0,
+            edited_at: None,
+        }
+    }
+
+    /// Every edit lands here: the changed line loses its error mark
+    /// right away (the next live check re-confirms or clears it), and
+    /// the revision/timestamp feed the typing-pause checker.
+    fn edited(&mut self, y: usize) {
+        self.dirty = true;
+        self.rev = self.rev.wrapping_add(1);
+        self.edited_at = Some(std::time::Instant::now());
+        self.diags.retain(|d| d.line != y);
+    }
+
+    /// Toggle a stop point on line `y`; returns true when now set.
+    pub fn toggle_breakpoint(&mut self, y: usize) -> bool {
+        if self.breakpoints.remove(&y) {
+            false
+        } else {
+            self.breakpoints.insert(y);
+            true
+        }
+    }
+
+    /// A line was inserted at index `at`: marks at or below it follow.
+    fn marks_insert_line(&mut self, at: usize) {
+        self.breakpoints = self
+            .breakpoints
+            .iter()
+            .map(|&l| if l >= at { l + 1 } else { l })
+            .collect();
+        for d in &mut self.diags {
+            if d.line >= at {
+                d.line += 1;
+            }
+        }
+    }
+
+    /// The line at index `at` was removed (merged upward): marks below
+    /// move up; a mark on the removed line joins the line above.
+    fn marks_remove_line(&mut self, at: usize) {
+        self.breakpoints = self
+            .breakpoints
+            .iter()
+            .map(|&l| if l >= at { l.saturating_sub(1) } else { l })
+            .collect();
+        self.diags.retain(|d| d.line != at);
+        for d in &mut self.diags {
+            if d.line > at {
+                d.line -= 1;
+            }
         }
     }
 
@@ -109,7 +182,7 @@ impl Buffer {
         let idx = byte_idx(&self.lines[self.cy], self.cx);
         self.lines[self.cy].insert(idx, c);
         self.cx += 1;
-        self.dirty = true;
+        self.edited(self.cy);
     }
 
     pub fn insert_tab(&mut self) {
@@ -129,7 +202,8 @@ impl Buffer {
         self.cy += 1;
         self.cx = indent.chars().count();
         self.lines.insert(self.cy, format!("{indent}{rest}"));
-        self.dirty = true;
+        self.marks_insert_line(self.cy);
+        self.edited(self.cy - 1);
     }
 
     pub fn backspace(&mut self) {
@@ -137,13 +211,14 @@ impl Buffer {
             let idx = byte_idx(&self.lines[self.cy], self.cx - 1);
             self.lines[self.cy].remove(idx);
             self.cx -= 1;
-            self.dirty = true;
+            self.edited(self.cy);
         } else if self.cy > 0 {
             let line = self.lines.remove(self.cy);
+            self.marks_remove_line(self.cy);
             self.cy -= 1;
             self.cx = self.line_len(self.cy);
             self.lines[self.cy].push_str(&line);
-            self.dirty = true;
+            self.edited(self.cy);
         }
     }
 
@@ -152,11 +227,12 @@ impl Buffer {
         if self.cx < len {
             let idx = byte_idx(&self.lines[self.cy], self.cx);
             self.lines[self.cy].remove(idx);
-            self.dirty = true;
+            self.edited(self.cy);
         } else if self.cy + 1 < self.lines.len() {
             let line = self.lines.remove(self.cy + 1);
+            self.marks_remove_line(self.cy + 1);
             self.lines[self.cy].push_str(&line);
-            self.dirty = true;
+            self.edited(self.cy);
         }
     }
 

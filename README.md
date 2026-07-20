@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.PNG" width="128" alt="the silver logo">
+
 # 🐱 silver
 
 **A cozy, cat-powered IDE that lives in your terminal — or in its own window.**
@@ -35,7 +37,11 @@ It's built around one idea: **your RAM belongs to your programs, not your editor
 - 📑 **File rail** — open files live in a slim rail on the right edge; hover for names, click to swap
 - ⌨️ **App-switcher for files** — `ctrl+tab` opens an OS-style overlay: tab through open files, enter swaps the pick into your last active pane
 - 🖥️ **A real terminal inside** — a genuine PTY running your login shell: interactive CLIs (claude, python, git…), colors, arrow keys, tab-completion, and your usual prompt showing the current folder
-- ▶️ **One-click run** — the ▶ button in the header runs the file you're editing (Rust, Python, JS/TS, Go, C/C++, Java, shell, and more) in a terminal pane
+- ▶️ **One-click run** — the ▶ button in the header runs the file you're editing (Rust, Python, JS/TS, Dart/Flutter, Go, C/C++, Java, shell, and more) in a terminal pane
+- 🔴 **Live error detection** — stop typing for a second and your code is checked in the background; bad lines get a red wash, a `✗` in the gutter, and the message at the pane's edge. Works for Rust, Python, JS, Dart, C/C++, shell, and TOML using each language's own free tools — nothing to install, and files are checked the moment you open or save them too
+- 💥 **Crashes pop up by themselves** — when a ▶ run fails, a window appears with the program's own error output, and the `file:line` it names turns red in your editor
+- ⏸️ **Stop points & real debugging** — `ctrl+p` drops a red ● on a line; `ctrl+g` runs your program under a real debugger (lldb / pdb) that actually stops there, so you can step (`n`), continue (`c`), and print variables (`p x`) in the built-in terminal
+- ✨ **Code suggestions as you type** — a small popup offers keywords and words from your own file; `↑/↓` to pick, `tab` to accept, `ctrl+space` to summon it
 - 🎨 **Syntax highlighting** for Rust, JS/TS, Python, Go, C/C++, Java, shell, TOML/YAML, and more
 - 🖱️ Mouse everywhere — click to place the cursor, drag tabs to split, scroll with the wheel (in the TUI too)
 - 🌫️ Popups blur the background so you always know what's focused
@@ -46,9 +52,22 @@ It's built around one idea: **your RAM belongs to your programs, not your editor
 
 ## Install
 
-silver installs the same way on every OS — straight from your terminal.
+### Option A — download the ready-made app (no Rust needed)
 
-### 1. Install Rust (one time)
+Grab the build for your OS from the **[Releases page](https://github.com/karanleo-coder/Silver_IDE/releases)**:
+
+| OS | Download | Then |
+|---|---|---|
+| macOS | `silver-macos-arm64.tar.gz` | unpack, run `./silver_kb install-app` → **Silver** appears in Spotlight & the Dock with its logo |
+| Linux | `silver-linux-x86_64.tar.gz` | unpack, run `./silver_kb install-app` → **Silver** appears in your app launcher with its logo |
+| Windows | `silver-windows-x86_64.zip` | unpack, double-click `silver_kb.exe` (or run `silver_kb.exe --app`) — the exe carries the logo |
+
+> macOS may warn about an unsigned app the first time: right-click → Open, or
+> `xattr -d com.apple.quarantine silver_kb`.
+
+### Option B — build it yourself with cargo
+
+#### 1. Install Rust (one time)
 
 **macOS / Linux**
 ```sh
@@ -61,7 +80,7 @@ winget install Rustlang.Rustup
 ```
 > On Windows, rustup will ask for the Visual Studio C++ Build Tools — let it install them.
 
-### 2. Install silver
+#### 2. Install silver
 
 **All platforms — one command:**
 ```sh
@@ -70,12 +89,12 @@ cargo install --git https://github.com/karanleo-coder/Silver_IDE
 
 Cargo builds an optimized release binary and puts `silver_kb` on your PATH. Done.
 
-### 3. Run it
+#### 3. Run it
 
 ```sh
 silver_kb              # inside your terminal — the lightest IDE you'll ever run
 silver_kb --app        # as its own windowed app
-silver_kb install-app  # macOS: create ~/Applications/Silver.app for Spotlight & Dock
+silver_kb install-app  # macOS: Silver.app for Spotlight & Dock · Linux: app-launcher entry
 ```
 
 **Updating:** re-run `cargo install --git https://github.com/karanleo-coder/Silver_IDE --force`
@@ -127,6 +146,9 @@ start                # open the editor there (or: start <path>)
 | `ctrl+x` | close the shown tab |
 | `ctrl+l` | location dropdown (browse & copy paths) |
 | `alt+←` / `alt+→` | resize the split |
+| `ctrl+p` | toggle a ● stop point on the cursor's line |
+| `ctrl+g` | debug run — stops at your stop points |
+| `ctrl+space` | open the code-suggestion popup |
 | `ctrl+h` | back to the home screen |
 | `ctrl+q` | quit (warns about unsaved changes) |
 
@@ -140,11 +162,21 @@ start                # open the editor there (or: start <path>)
 | `save` | save the active file |
 | `spawn` | a **real** terminal tab, right where you are — the file slides aside, still visible |
 | `run` | run the active file's program in a terminal |
+| `check` | check the file for errors right now (aliases: `lint`, `errors`) |
+| `break` | toggle a stop point on the cursor's line (aliases: `bp`, `stop`) |
+| `debug` | run under a debugger, stopping at your stop points (aliases: `dbg`) |
 | `keys` | view & edit shortcut keys *and* command words |
 | `cat name <name>` / `cat color <color>` | your cat, your rules (`pink`, `#ff79c6`, …) |
 | `theme <color>` | accent color |
 | `cursor <style>` | `block` · `bar` · `underline` · `hollow`, plus `cursor blink on/off` |
 | `home` / `clear` / `exit` | the classics |
+
+### Errors, stop points, and suggestions
+
+- **Errors find you.** Pause typing for a second and silver checks your code with the language's own tools (`cargo check`, `dart analyze`, `python`, `node --check`, `cc`, `bash -n`, …). Bad lines get a red wash and a `✗` in the gutter; put the cursor on one and the full message appears at the pane's edge. Saving and opening files re-checks them too. If `shellcheck` or `pyflakes` are installed, silver uses them automatically for even sharper results.
+- **Crashes explain themselves.** When a ▶ run exits with an error, a window pops up with the program's own output — and any `file:line` in a stack trace, panic, or traceback is marked red in your editor.
+- **Stop the program where you want.** `ctrl+p` toggles a red ● stop point; `ctrl+g` builds and runs under a real debugger (lldb for Rust/C/C++, pdb for Python) with your stop points pre-set. In the terminal: `c` continues, `n` steps a line, `p someVariable` prints a value.
+- **Suggestions as you type.** After two letters, a popup offers language keywords plus words from your file — `↑/↓` picks, `tab` accepts, `esc` dismisses, `ctrl+space` summons it on demand.
 
 ### The built-in terminal
 

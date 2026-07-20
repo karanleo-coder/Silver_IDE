@@ -25,6 +25,12 @@ pub enum Action {
     Run,
     /// Open the customize panel to view and rebind keys & commands.
     Keys,
+    /// Check the active file for errors right now.
+    Check,
+    /// Run the active file under a debugger, stopping at stop points.
+    Debug,
+    /// Toggle a stop point on the cursor's line.
+    BreakToggle,
     Unknown(String),
 }
 
@@ -42,6 +48,9 @@ fn builtin_alias(word: &str) -> Option<&'static str> {
         "term" | "terminal" => "spawn",
         "r" => "run",
         "shortcuts" | "binds" | "commands" | "cmds" => "keys",
+        "lint" | "errors" => "check",
+        "dbg" | "lldb" | "pdb" => "debug",
+        "bp" | "stop" => "break",
         _ => return None,
     })
 }
@@ -102,6 +111,9 @@ pub fn parse(input: &str, cmds: &BTreeMap<String, String>) -> Action {
         Some("spawn") => Action::Spawn,
         Some("run") => Action::Run,
         Some("keys") => Action::Keys,
+        Some("check") => Action::Check,
+        Some("debug") => Action::Debug,
+        Some("break") => Action::BreakToggle,
         _ => Action::Unknown(format!("unknown command: {input}  (try `help`)")),
     }
 }
@@ -118,6 +130,9 @@ pub fn help_lines(cmds: &BTreeMap<String, String>) -> Vec<String> {
         format!("{} save the active file", dots(&w("save"))),
         format!("{} a real terminal tab, here; the file moves right", dots(&w("spawn"))),
         format!("{} run the active file's program in a terminal", dots(&w("run"))),
+        format!("{} check the file for errors — they turn red", dots(&w("check"))),
+        format!("{} toggle a stop point on the cursor's line", dots(&w("break"))),
+        format!("{} run stopping at your stop points (debugger)", dots(&w("debug"))),
         format!("{} view & edit shortcut keys and commands", dots(&w("keys"))),
         format!("{} rename your cat", dots(&format!("{} name <name>", w("cat")))),
         format!("{} recolor your cat (names or #hex)", dots(&format!("{} color <color>", w("cat")))),

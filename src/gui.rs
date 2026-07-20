@@ -23,9 +23,17 @@ const BAR_BG: Color32 = Color32::from_rgb(24, 24, 31);
 const TICK: Duration = Duration::from_millis(120);
 
 pub fn run() -> eframe::Result {
+    // The silver logo, pre-baked to raw pixels at build time — the
+    // window/taskbar icon on every OS, no image decoder needed.
+    let icon = egui::IconData {
+        rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("silver")
+            .with_icon(icon)
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([560.0, 380.0]),
         ..Default::default()

@@ -115,7 +115,7 @@ fn comment_prefix(ext: &str) -> Option<&'static str> {
     }
 }
 
-fn keywords_for(ext: &str) -> &'static [&'static str] {
+pub fn keywords_for(ext: &str) -> &'static [&'static str] {
     match ext {
         "rs" => &[
             "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "impl", "trait", "for",

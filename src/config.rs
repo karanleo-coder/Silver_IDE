@@ -104,6 +104,9 @@ pub fn default_commands() -> BTreeMap<String, String> {
         ("spawn", "spawn"),
         ("run", "run"),
         ("keys", "keys"),
+        ("check", "check"),
+        ("debug", "debug"),
+        ("break", "break"),
     ] {
         m.insert(action.to_string(), word.to_string());
     }
@@ -125,6 +128,9 @@ pub fn default_keys() -> BTreeMap<String, String> {
     m.insert("close_pane".into(), "ctrl+x".into());
     m.insert("split_left".into(), "alt+left".into());
     m.insert("split_right".into(), "alt+right".into());
+    m.insert("toggle_breakpoint".into(), "ctrl+p".into());
+    m.insert("debug_run".into(), "ctrl+g".into());
+    m.insert("complete".into(), "ctrl+space".into());
     m
 }
 

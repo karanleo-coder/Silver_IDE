@@ -9,6 +9,10 @@ license = "MIT"
 name = "silver_kb"
 path = "src/main.rs"
 
+[target.'cfg(windows)'.build-dependencies]
+# Stamps the app icon into the Windows .exe.
+winresource = "0.1"
+
 [dependencies]
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
