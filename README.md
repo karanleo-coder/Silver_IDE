@@ -54,13 +54,23 @@ It's built around one idea: **your RAM belongs to your programs, not your editor
 
 ### Option A — download the ready-made app (no Rust needed)
 
-Grab the build for your OS from the **[Releases page](https://github.com/karanleo-coder/Silver_IDE/releases)**:
+One binary per OS. Each is **both** the terminal IDE *and* the windowed app.
 
-| OS | Download | Then |
+| OS | Direct download | Then |
 |---|---|---|
-| macOS | `silver-macos-arm64.tar.gz` | unpack, run `./silver_kb install-app` → **Silver** appears in Spotlight & the Dock with its logo |
-| Linux | `silver-linux-x86_64.tar.gz` | unpack, run `./silver_kb install-app` → **Silver** appears in your app launcher with its logo |
-| Windows | `silver-windows-x86_64.zip` | unpack, double-click `silver_kb.exe` (or run `silver_kb.exe --app`) — the exe carries the logo |
+| macOS (Apple Silicon) | **[silver-macos-arm64.tar.gz](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-macos-arm64.tar.gz)** | unpack, run `./silver_kb install-app` → **Silver** appears in Spotlight & the Dock with its logo |
+| Linux (x86_64) | **[silver-linux-x86_64.tar.gz](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-linux-x86_64.tar.gz)** | unpack, run `./silver_kb install-app` → **Silver** appears in your app launcher with its logo |
+| Windows (x86_64) | **[silver-windows-x86_64.zip](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-windows-x86_64.zip)** | unpack, double-click `silver_kb.exe` (or run `silver_kb.exe --app`) — the exe carries the logo |
+
+All versions live on the **[Releases page](https://github.com/karanleo-coder/Silver_IDE/releases)**.
+
+```sh
+# macOS / Linux quick start after downloading:
+tar -xzf silver-*.tar.gz
+./silver_kb                # terminal IDE
+./silver_kb --app          # windowed app
+./silver_kb install-app    # add it to Spotlight / your app launcher
+```
 
 > macOS may warn about an unsigned app the first time: right-click → Open, or
 > `xattr -d com.apple.quarantine silver_kb`.
