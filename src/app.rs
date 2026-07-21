@@ -9,7 +9,7 @@ use ratatui::layout::{Position as GridPos, Rect};
 use ratatui::DefaultTerminal;
 
 use crate::commands::{self, Action};
-use crate::config::{expand_tilde, Config, CAT_COLORS};
+use crate::config::{clean_path, expand_tilde, Config, CAT_COLORS};
 use crate::editor::buffer::Buffer;
 use crate::editor::complete::{self, Completion};
 use crate::editor::diagnostics::{self, CheckResult};
@@ -36,9 +36,17 @@ pub struct HomeState {
     pub selected: usize,
     pub focus_terminal: bool,
     pub term_input: String,
+    /// Caret position in `term_input`, counted in chars (←/→ move it).
+    pub term_cursor: usize,
     pub term_output: Vec<String>,
     /// Lines scrolled up from the bottom of the output.
     pub term_scroll: usize,
+    /// Commands already run, oldest first (↑/↓ walk through them).
+    pub term_history: Vec<String>,
+    /// Where ↑/↓ currently are in the history; None = the live line.
+    pub term_hist: Option<usize>,
+    /// The line being typed, parked while browsing history.
+    pub term_draft: String,
     pub customize: Option<CustomizeState>,
     pub browser: Option<HomeBrowser>,
 }
@@ -49,12 +57,16 @@ impl Default for HomeState {
             selected: 0,
             focus_terminal: false,
             term_input: String::new(),
+            term_cursor: 0,
             term_output: vec![
                 "welcome to silver — `cd <path>` browses a folder,".into(),
                 "`start` opens the editor there. or pick a recent".into(),
                 "project with ↑/↓ and Enter.".into(),
             ],
             term_scroll: 0,
+            term_history: Vec::new(),
+            term_hist: None,
+            term_draft: String::new(),
             customize: None,
             browser: None,
         }
@@ -369,6 +381,12 @@ fn read_dir_flat(dir: &Path) -> Vec<FileEntry> {
     entries
 }
 
+/// Byte offset of the `ci`-th char in `s` (its length when past the
+/// end), so cursor arithmetic can stay in chars.
+fn byte_at(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
+}
+
 /// The shell command that runs a file's program, by extension.
 /// Rust projects go through cargo when the root has a Cargo.toml.
 fn run_command_for(path: &Path, root: &Path) -> Option<String> {
@@ -382,7 +400,11 @@ fn run_command_for(path: &Path, root: &Path) -> Option<String> {
         } else {
             format!("rustc \"{p}\" -o \"{bin}\" && \"{bin}\"")
         }),
-        "py" => Some(format!("python3 \"{p}\"")),
+        "py" => {
+            // Windows installs python as `python`; python3 is unix.
+            let py = if cfg!(windows) { "python" } else { "python3" };
+            Some(format!("{py} \"{p}\""))
+        }
         "js" | "mjs" => Some(format!("node \"{p}\"")),
         "ts" => Some(format!("npx tsx \"{p}\"")),
         "sh" => Some(format!("sh \"{p}\"")),
@@ -467,7 +489,8 @@ fn debug_command_for(path: &Path, root: &Path, bps: &[usize]) -> Option<String> 
         }
         "py" => {
             let stops: String = bps.iter().map(|n| format!(" -c \"b {n}\"")).collect();
-            Some(format!("python3 -m pdb{stops} -c c \"{p}\""))
+            let py = if cfg!(windows) { "python" } else { "python3" };
+            Some(format!("{py} -m pdb{stops} -c c \"{p}\""))
         }
         _ => None,
     }
@@ -948,7 +971,7 @@ impl App {
     /// already open moves over instead of reopening; anything else
     /// opens as a new tab on top of that pane's stack.
     pub fn place_file(&mut self, path: &Path, dst: usize) {
-        let canon = match path.canonicalize() {
+        let canon = match path.canonicalize().map(clean_path) {
             Ok(p) => p,
             Err(e) => {
                 self.toast(format!("cannot open: {e}"));
@@ -1804,20 +1827,48 @@ impl App {
         }
 
         if self.home.focus_terminal {
+            let len = self.home.term_input.chars().count();
+            let cur = self.home.term_cursor.min(len);
             match k.code {
                 KeyCode::Enter => {
                     self.home.term_scroll = 0;
+                    self.home.term_cursor = 0;
+                    self.home.term_hist = None;
                     let cmd = std::mem::take(&mut self.home.term_input);
+                    let trimmed = cmd.trim();
+                    if !trimmed.is_empty()
+                        && self.home.term_history.last().map(String::as_str) != Some(trimmed)
+                    {
+                        self.home.term_history.push(trimmed.to_string());
+                    }
                     self.run_home_command(&cmd);
                 }
                 KeyCode::Backspace => {
-                    self.home.term_input.pop();
+                    if cur > 0 {
+                        let at = byte_at(&self.home.term_input, cur - 1);
+                        self.home.term_input.remove(at);
+                        self.home.term_cursor = cur - 1;
+                    }
                 }
+                KeyCode::Delete => {
+                    if cur < len {
+                        let at = byte_at(&self.home.term_input, cur);
+                        self.home.term_input.remove(at);
+                    }
+                }
+                KeyCode::Left => self.home.term_cursor = cur.saturating_sub(1),
+                KeyCode::Right => self.home.term_cursor = (cur + 1).min(len),
+                KeyCode::Home => self.home.term_cursor = 0,
+                KeyCode::End => self.home.term_cursor = len,
+                KeyCode::Up => self.home_history_step(-1),
+                KeyCode::Down => self.home_history_step(1),
                 KeyCode::Esc => self.home.focus_terminal = false,
                 KeyCode::PageUp => self.scroll_home_terminal(5),
                 KeyCode::PageDown => self.scroll_home_terminal(-5),
                 KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.home.term_input.push(c);
+                    let at = byte_at(&self.home.term_input, cur);
+                    self.home.term_input.insert(at, c);
+                    self.home.term_cursor = cur + 1;
                 }
                 _ => {}
             }
@@ -1958,6 +2009,31 @@ impl App {
         }
     }
 
+    /// ↑/↓ in the home terminal: walk the command history, keeping
+    /// whatever was being typed safe for the way back down.
+    fn home_history_step(&mut self, dir: i32) {
+        let h = &mut self.home;
+        if h.term_history.is_empty() {
+            return;
+        }
+        let next = match (h.term_hist, dir) {
+            (None, d) if d < 0 => {
+                h.term_draft = std::mem::take(&mut h.term_input);
+                Some(h.term_history.len() - 1)
+            }
+            (None, _) => return,
+            (Some(i), d) if d < 0 => Some(i.saturating_sub(1)),
+            (Some(i), _) if i + 1 < h.term_history.len() => Some(i + 1),
+            (Some(_), _) => None,
+        };
+        h.term_hist = next;
+        h.term_input = match next {
+            Some(i) => h.term_history[i].clone(),
+            None => std::mem::take(&mut h.term_draft),
+        };
+        h.term_cursor = h.term_input.chars().count();
+    }
+
     /// Scroll the home terminal output; positive = older lines.
     pub fn scroll_home_terminal(&mut self, delta: i32) {
         let max = self.home.term_output.len();
@@ -2069,7 +2145,7 @@ impl App {
 
     fn home_cd(&mut self, raw: &str) {
         let path = self.resolve_home_path(raw);
-        match path.canonicalize() {
+        match path.canonicalize().map(clean_path) {
             Ok(p) if p.is_dir() => {
                 self.home_println(format!("  now in {}", p.display()));
                 self.home_println("  `start` opens the editor here · enter copies a path");
@@ -2084,7 +2160,7 @@ impl App {
     }
 
     pub fn open_project(&mut self, path: &Path) {
-        let canon = match path.canonicalize() {
+        let canon = match path.canonicalize().map(clean_path) {
             Ok(p) if p.is_dir() => p,
             Ok(_) => {
                 self.home_println(format!("  not a folder: {}", path.display()));
@@ -2765,7 +2841,7 @@ impl App {
     }
 
     pub fn open_file_beside(&mut self, path: &Path) {
-        let canon = match path.canonicalize() {
+        let canon = match path.canonicalize().map(clean_path) {
             Ok(p) => p,
             Err(e) => {
                 self.popup_println(format!("  open: {e}"));
@@ -2833,6 +2909,44 @@ mod tests {
     fn draw_once(app: &mut App) {
         let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
         term.draw(|f| crate::ui::draw(f, app)).unwrap();
+    }
+
+    #[test]
+    fn home_terminal_cursor_and_history() {
+        let mut app = App::new();
+        app.gui_mode = true;
+        app.home.focus_terminal = true;
+        let key = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::empty()));
+
+        // Type `hlp`, walk the cursor back inside it, fix it to `help`.
+        for c in "hlp".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.home.term_input, "help");
+        assert_eq!(app.home.term_cursor, 2);
+        // The prompt renders with the cursor mid-line.
+        draw_once(&mut app);
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.home.term_cursor, 4);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.home.term_input.is_empty());
+
+        // ↑ recalls the command; a half-typed line survives the trip.
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.home.term_input, "help");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.home.term_input, "");
+        for c in "ls".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.home.term_input, "help");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.home.term_input, "ls");
+        assert_eq!(app.home.term_cursor, 2);
     }
 
     #[test]

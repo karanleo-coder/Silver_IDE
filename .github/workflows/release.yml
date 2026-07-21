@@ -24,6 +24,11 @@ jobs:
           - os: ubuntu-latest
             name: silver-linux-x86_64
             bin: silver_kb
+          # Raspberry Pi, ARM laptops/servers: a native arm64 build,
+          # so the binary's format matches the machine.
+          - os: ubuntu-24.04-arm
+            name: silver-linux-arm64
+            bin: silver_kb
           - os: windows-latest
             name: silver-windows-x86_64
             bin: silver_kb.exe

@@ -273,6 +273,24 @@ pub fn parse_color(s: &str) -> Color {
     }
 }
 
+/// On Windows, `canonicalize` returns `\\?\C:\...` verbatim paths.
+/// cmd.exe refuses those as a working directory (the terminal would
+/// silently fail to open) and they look wrong in titles, so strip the
+/// prefix back off. Everywhere else the path passes through untouched.
+pub fn clean_path(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
 pub fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix('~') {
         if let Some(base) = directories::BaseDirs::new() {

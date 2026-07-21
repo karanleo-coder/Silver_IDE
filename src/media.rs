@@ -2,6 +2,7 @@
 //! thread every couple of seconds so drawing never blocks; the UI
 //! only animates its equalizer wave while something really plays.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

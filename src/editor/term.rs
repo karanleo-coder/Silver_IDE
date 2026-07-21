@@ -58,7 +58,12 @@ impl TermSession {
         })?;
 
         #[cfg(target_os = "windows")]
-        let mut cmd = CommandBuilder::new("cmd.exe");
+        let mut cmd = {
+            // ConPTY wants a full path more often than not; COMSPEC
+            // always has one (C:\Windows\system32\cmd.exe).
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+            CommandBuilder::new(shell)
+        };
         #[cfg(not(target_os = "windows"))]
         let mut cmd = {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -69,8 +74,11 @@ impl TermSession {
             c
         };
         cmd.cwd(&self.cwd);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        #[cfg(not(target_os = "windows"))]
+        {
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+        }
 
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);

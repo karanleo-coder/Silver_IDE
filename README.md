@@ -60,7 +60,11 @@ One binary per OS. Each is **both** the terminal IDE *and* the windowed app.
 |---|---|---|
 | macOS (Apple Silicon) | **[silver-macos-arm64.tar.gz](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-macos-arm64.tar.gz)** | unpack, run `./silver_kb install-app` → **Silver** appears in Spotlight & the Dock with its logo |
 | Linux (x86_64) | **[silver-linux-x86_64.tar.gz](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-linux-x86_64.tar.gz)** | unpack, run `./silver_kb install-app` → **Silver** appears in your app launcher with its logo |
-| Windows (x86_64) | **[silver-windows-x86_64.zip](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-windows-x86_64.zip)** | unpack, double-click `silver_kb.exe` (or run `silver_kb.exe --app`) — the exe carries the logo |
+| Linux (arm64 — Raspberry Pi, ARM laptops) | **[silver-linux-arm64.tar.gz](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-linux-arm64.tar.gz)** | unpack, run `./silver_kb install-app` → **Silver** appears in your app launcher with its logo |
+| Windows (x86_64) | **[silver-windows-x86_64.zip](https://github.com/karanleo-coder/Silver_IDE/releases/latest/download/silver-windows-x86_64.zip)** | unpack, **double-click `silver_kb.exe`** → the app window opens; run `silver_kb.exe` from a terminal for the terminal IDE |
+
+> Not sure which Linux build? Run `uname -m` — `x86_64` means x86_64, `aarch64` means arm64.
+> Grabbing the wrong one is what causes `exec format error`.
 
 All versions live on the **[Releases page](https://github.com/karanleo-coder/Silver_IDE/releases)**.
 

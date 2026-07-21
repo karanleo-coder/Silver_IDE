@@ -248,15 +248,22 @@ fn draw_side_terminal(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), out_area);
 
     let prompt = "~ $ ";
+    // Slide the input sideways when it outgrows the row, so the
+    // cursor (moved with ←/→) always stays on screen.
+    let width = (in_area.width as usize).saturating_sub(prompt.len() + 1).max(1);
+    let chars: Vec<char> = app.home.term_input.chars().collect();
+    let cur = app.home.term_cursor.min(chars.len());
+    let start = cur.saturating_sub(width.saturating_sub(1));
+    let visible: String = chars.iter().skip(start).take(width).collect();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(prompt, Style::new().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::styled(app.home.term_input.clone(), Style::new().fg(Color::White)),
+            Span::styled(visible, Style::new().fg(Color::White)),
         ])),
         in_area,
     );
     if focused {
-        let x = in_area.x + prompt.len() as u16 + app.home.term_input.chars().count() as u16;
+        let x = in_area.x + (prompt.len() + cur - start) as u16;
         f.set_cursor_position((x.min(in_area.right().saturating_sub(1)), in_area.y));
     }
 }

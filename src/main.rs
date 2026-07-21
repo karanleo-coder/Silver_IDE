@@ -12,6 +12,10 @@ fn main() {
     match arg.as_str() {
         "--app" | "app" | "-a" => {
             adopt_shell_path();
+            #[cfg(windows)]
+            if windows_double_clicked() {
+                windows_detach_console();
+            }
             if let Err(e) = gui::run() {
                 eprintln!("silver: could not open the app window: {e}");
                 std::process::exit(1);
@@ -24,8 +28,23 @@ fn main() {
             println!("  silver_kb              run in this terminal (TUI)");
             println!("  silver_kb --app        open as a native window");
             println!("  silver_kb install-app  create Silver.app in ~/Applications (macOS)");
+            println!();
+            println!("  on Windows, double-clicking silver_kb.exe opens the app window;");
+            println!("  run silver_kb.exe from a terminal for the TUI.");
         }
         _ => {
+            // Double-clicking the exe on Windows should feel like
+            // opening any app: the window, not a TUI in a surprise
+            // console. From a real terminal, the TUI as usual.
+            #[cfg(windows)]
+            if arg.is_empty() && windows_double_clicked() {
+                windows_detach_console();
+                adopt_shell_path();
+                if gui::run().is_err() {
+                    std::process::exit(1);
+                }
+                return;
+            }
             let mut terminal = ratatui::init();
             let result = app::App::new().run(&mut terminal);
             ratatui::restore();
@@ -39,6 +58,32 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// A console exe that was double-clicked runs in a console of its
+/// very own; started from cmd/PowerShell, the shell lives there too.
+/// Counting the processes attached to our console tells them apart.
+#[cfg(windows)]
+fn windows_double_clicked() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(ids: *mut u32, n: u32) -> u32;
+    }
+    let mut ids = [0u32; 2];
+    (unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) }) <= 1
+}
+
+/// Let go of the console so the empty window it came in closes and
+/// only the app window remains.
+#[cfg(windows)]
+fn windows_detach_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FreeConsole() -> i32;
+    }
+    unsafe {
+        FreeConsole();
     }
 }
 
