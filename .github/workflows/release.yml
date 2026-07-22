@@ -56,13 +56,13 @@ jobs:
         if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
-      - name: build
-        run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            cargo build --release --target ${{ matrix.target }}
-          else
-            cargo build --release
-          fi
+      - name: build (with target)
+        if: matrix.target != ''
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: build (default target)
+        if: matrix.target == ''
+        run: cargo build --release
 
       - name: package (macOS / Linux)
         if: runner.os != 'Windows'
