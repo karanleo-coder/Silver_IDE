@@ -80,6 +80,15 @@ tar -xzf silver-*.tar.gz
 > macOS may warn about an unsigned app the first time: right-click → Open, or
 > `xattr -d com.apple.quarantine silver_kb`.
 
+> **Linux, windowed mode (`--app`) fails with "failed to load one of xlib's shared libraries"?**
+> The terminal IDE still works — that error is specific to opening a window. Minimal
+> Linux installs (server images, some ARM devices/dev boards) often ship the `-dev`
+> build headers' runtime counterparts missing. Install them and try again:
+> ```sh
+> sudo apt-get install -y libx11-6 libxcursor1 libxrandr2 libxi6 \
+>   libxkbcommon0 libwayland-client0 libgl1
+> ```
+
 ### Option B — build it yourself with cargo
 
 #### 1. Install Rust (one time)
