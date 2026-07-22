@@ -49,7 +49,38 @@ fn detect() -> bool {
     !String::from_utf8_lossy(&out.stdout).trim().is_empty()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: WASAPI's loudness meter on the default output device —
+/// anything actually making sound lifts the peak above zero.
+#[cfg(target_os = "windows")]
+fn detect() -> bool {
+    use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    unsafe {
+        // Per-thread COM setup; every call after the first just says
+        // "already done", which is fine.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let Ok(devices): windows::core::Result<IMMDeviceEnumerator> =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            return false;
+        };
+        let Ok(device) = devices.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return false;
+        };
+        let Ok(meter) = device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None) else {
+            return false;
+        };
+        meter.GetPeakValue().map(|peak| peak > 0.01).unwrap_or(false)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn detect() -> bool {
     false
 }

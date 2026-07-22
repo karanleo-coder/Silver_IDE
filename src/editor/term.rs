@@ -21,7 +21,9 @@ pub struct TermSession {
     pub scroll: usize,
     /// The emulated screen, fed by the PTY reader thread.
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Option<Box<dyn Write + Send>>,
+    /// Shared with the reader thread, which answers the shell's
+    /// "where is the cursor?" queries on our behalf.
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
     /// Set when the PTY could not start; drawn instead of a screen.
@@ -83,11 +85,15 @@ impl TermSession {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
         let parser = Arc::clone(&self.parser);
+        let responder = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            // Tail of the previous chunk, so a query split across two
+            // reads is still spotted.
+            let mut seam: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -95,6 +101,24 @@ impl TermSession {
                         if let Ok(mut p) = parser.lock() {
                             p.process(&buf[..n]);
                         }
+                        // "Where is the cursor?" (ESC[6n) must be
+                        // answered: Windows' ConPTY asks it the moment
+                        // the terminal opens and shows nothing until it
+                        // hears back; some TUI programs ask it too.
+                        seam.extend_from_slice(&buf[..n]);
+                        let asks = seam.windows(4).filter(|w| *w == b"\x1b[6n").count();
+                        for _ in 0..asks {
+                            let (r, c) = parser
+                                .lock()
+                                .map(|p| p.screen().cursor_position())
+                                .unwrap_or((0, 0));
+                            if let Ok(mut w) = responder.lock() {
+                                let _ = w.write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
+                                let _ = w.flush();
+                            }
+                        }
+                        let keep = seam.len().min(3);
+                        seam.drain(..seam.len() - keep);
                     }
                 }
             }
@@ -121,9 +145,11 @@ impl TermSession {
             return;
         }
         self.scroll = 0;
-        if let Some(w) = self.writer.as_mut() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
+        if let Some(w) = self.writer.as_ref() {
+            if let Ok(mut w) = w.lock() {
+                let _ = w.write_all(bytes);
+                let _ = w.flush();
+            }
         }
     }
 
