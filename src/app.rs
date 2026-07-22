@@ -252,6 +252,7 @@ pub fn command_action_help(action: &str) -> &'static str {
         "check" => "check the file for errors",
         "debug" => "run, stopping at stop points",
         "break" => "toggle a stop point here",
+        "click" => "open files by clicking, on|off",
         _ => "",
     }
 }
@@ -615,6 +616,8 @@ impl App {
             Activate,
             Switch(usize),
             Run,
+            FilesActivate,
+            LocationActivate,
         }
         let pos = GridPos { x, y };
         let mut after: Option<After> = None;
@@ -696,22 +699,30 @@ impl App {
                     break;
                 }
                 MouseTarget::FilesPanel { area, first } if area.contains(pos) => {
+                    let click_opens = self.config.open_on_click;
                     if let Some(ed) = self.editor.as_mut() {
                         if let Some(files) = ed.files.as_mut() {
                             let idx = first + (y - area.y) as usize;
                             if idx < files.entries.len() {
                                 files.selected = idx;
+                                if click_opens {
+                                    after = Some(After::FilesActivate);
+                                }
                             }
                         }
                     }
                     break;
                 }
                 MouseTarget::Location { area, first } if area.contains(pos) => {
+                    let click_opens = self.config.open_on_click;
                     if let Some(ed) = self.editor.as_mut() {
                         if let Some(loc) = ed.location.as_mut() {
                             let idx = first + (y - area.y) as usize;
                             if idx < loc.entries.len() {
                                 loc.selected = idx;
+                                if click_opens {
+                                    after = Some(After::LocationActivate);
+                                }
                             }
                         }
                     }
@@ -725,6 +736,8 @@ impl App {
             Some(After::Zone) => self.open_place_picker(None),
             Some(After::Side(s)) => self.place_choose_side(s),
             Some(After::Activate) => self.place_activate(),
+            Some(After::FilesActivate) => self.files_activate(),
+            Some(After::LocationActivate) => self.location_activate(),
             Some(After::Switch(i)) => {
                 if let Some(sw) = self.editor.as_mut().and_then(|e| e.switcher.as_mut()) {
                     if i < sw.items.len() {
@@ -2643,6 +2656,29 @@ impl App {
                 }
                 self.toggle_breakpoint();
             }
+            Action::ClickOpen(rest) => {
+                let msg = match rest.as_str() {
+                    "on" | "true" | "yes" => {
+                        self.config.open_on_click = true;
+                        self.config.save();
+                        "click-to-open is on — clicking a file in the files panel opens it (`open` still works too)"
+                    }
+                    "off" | "false" | "no" => {
+                        self.config.open_on_click = false;
+                        self.config.save();
+                        "click-to-open is off — pick a file to copy its path, then `open` it"
+                    }
+                    "" => {
+                        if self.config.open_on_click {
+                            "click-to-open is on  (`click off` to go back to command-style opening)"
+                        } else {
+                            "click-to-open is off  (`click on` to open files by clicking them)"
+                        }
+                    }
+                    _ => "usage: click on|off",
+                };
+                self.popup_println(format!("  {msg}"));
+            }
             Action::Unknown(msg) => self.popup_println(format!("  {msg}")),
         }
     }
@@ -2710,7 +2746,6 @@ impl App {
     }
 
     fn on_key_files(&mut self, k: KeyEvent) {
-        let mut copied: Option<PathBuf> = None;
         {
             let Some(ed) = self.editor.as_mut() else { return };
             let Some(files) = ed.files.as_mut() else { return };
@@ -2719,37 +2754,56 @@ impl App {
                     ed.files = None;
                     return;
                 }
-                KeyCode::Up => files.selected = files.selected.saturating_sub(1),
+                KeyCode::Up => {
+                    files.selected = files.selected.saturating_sub(1);
+                    return;
+                }
                 KeyCode::Down => {
                     if !files.entries.is_empty() {
                         files.selected = (files.selected + 1).min(files.entries.len() - 1);
                     }
+                    return;
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(entry) = files.entries.get(files.selected).cloned() {
-                        if entry.is_dir {
-                            // Dirs are "buttons": minimized by default, expand on press.
-                            if !files.expanded.remove(&entry.path) {
-                                files.expanded.insert(entry.path.clone());
-                            }
-                            let mut entries = Vec::new();
-                            list_dir(&ed.root, 0, &files.expanded, &mut entries);
-                            files.entries = entries;
-                            files.selected = files
-                                .entries
-                                .iter()
-                                .position(|e| e.path == entry.path)
-                                .unwrap_or(0);
-                        } else {
-                            ed.pending_path = Some(entry.path.clone());
-                            copied = Some(entry.path);
-                        }
-                    }
-                }
-                _ => {}
+                KeyCode::Enter | KeyCode::Char(' ') => {}
+                _ => return,
             }
         }
-        if let Some(path) = copied {
+        self.files_activate();
+    }
+
+    /// Act on the selected files-panel row: dirs expand or collapse;
+    /// files open directly when click-to-open is on, otherwise the
+    /// path is copied for the terminal's `open` command.
+    fn files_activate(&mut self) {
+        let mut copied: Option<PathBuf> = None;
+        let mut open_now: Option<PathBuf> = None;
+        {
+            let Some(ed) = self.editor.as_mut() else { return };
+            let Some(files) = ed.files.as_mut() else { return };
+            let Some(entry) = files.entries.get(files.selected).cloned() else { return };
+            if entry.is_dir {
+                // Dirs are "buttons": minimized by default, expand on press.
+                if !files.expanded.remove(&entry.path) {
+                    files.expanded.insert(entry.path.clone());
+                }
+                let mut entries = Vec::new();
+                list_dir(&ed.root, 0, &files.expanded, &mut entries);
+                files.entries = entries;
+                files.selected = files
+                    .entries
+                    .iter()
+                    .position(|e| e.path == entry.path)
+                    .unwrap_or(0);
+            } else if self.config.open_on_click {
+                open_now = Some(entry.path);
+            } else {
+                ed.pending_path = Some(entry.path.clone());
+                copied = Some(entry.path);
+            }
+        }
+        if let Some(path) = open_now {
+            self.open_file_beside(&path);
+        } else if let Some(path) = copied {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -2762,7 +2816,6 @@ impl App {
     }
 
     fn on_key_location(&mut self, k: KeyEvent) {
-        let mut copied: Option<PathBuf> = None;
         {
             let Some(ed) = self.editor.as_mut() else { return };
             let Some(loc) = ed.location.as_mut() else { return };
@@ -2771,11 +2824,15 @@ impl App {
                     ed.location = None;
                     return;
                 }
-                KeyCode::Up => loc.selected = loc.selected.saturating_sub(1),
+                KeyCode::Up => {
+                    loc.selected = loc.selected.saturating_sub(1);
+                    return;
+                }
                 KeyCode::Down => {
                     if !loc.entries.is_empty() {
                         loc.selected = (loc.selected + 1).min(loc.entries.len() - 1);
                     }
+                    return;
                 }
                 KeyCode::Backspace => {
                     if let Some(parent) = loc.dir.parent().map(|p| p.to_path_buf()) {
@@ -2786,26 +2843,42 @@ impl App {
                         loc.entries = entries;
                         loc.selected = 0;
                     }
+                    return;
                 }
-                KeyCode::Enter => {
-                    if let Some(entry) = loc.entries.get(loc.selected).cloned() {
-                        if entry.is_dir {
-                            loc.dir = entry.path.clone();
-                            let mut entries = Vec::new();
-                            list_dir(&loc.dir, 0, &BTreeSet::new(), &mut entries);
-                            entries.retain(|e| e.depth == 0);
-                            loc.entries = entries;
-                            loc.selected = 0;
-                        } else {
-                            ed.pending_path = Some(entry.path.clone());
-                            copied = Some(entry.path);
-                        }
-                    }
-                }
-                _ => {}
+                KeyCode::Enter => {}
+                _ => return,
             }
         }
-        if let Some(path) = copied {
+        self.location_activate();
+    }
+
+    /// Act on the selected location row: dirs navigate into; files open
+    /// directly when click-to-open is on, otherwise the path is copied
+    /// for the terminal's `open` command.
+    fn location_activate(&mut self) {
+        let mut copied: Option<PathBuf> = None;
+        let mut open_now: Option<PathBuf> = None;
+        {
+            let Some(ed) = self.editor.as_mut() else { return };
+            let Some(loc) = ed.location.as_mut() else { return };
+            let Some(entry) = loc.entries.get(loc.selected).cloned() else { return };
+            if entry.is_dir {
+                loc.dir = entry.path.clone();
+                let mut entries = Vec::new();
+                list_dir(&loc.dir, 0, &BTreeSet::new(), &mut entries);
+                entries.retain(|e| e.depth == 0);
+                loc.entries = entries;
+                loc.selected = 0;
+            } else if self.config.open_on_click {
+                open_now = Some(entry.path);
+            } else {
+                ed.pending_path = Some(entry.path.clone());
+                copied = Some(entry.path);
+            }
+        }
+        if let Some(path) = open_now {
+            self.open_file_beside(&path);
+        } else if let Some(path) = copied {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -3469,5 +3542,52 @@ mod tests {
         app.set_split_to(mid);
         let split = app.editor.as_ref().unwrap().split;
         assert!((45..=55).contains(&split), "split near the middle, got {split}");
+    }
+
+    #[test]
+    fn click_to_open_toggle_changes_how_files_open() {
+        let cmds = crate::config::default_commands();
+        assert!(matches!(
+            commands::parse("click on", &cmds),
+            commands::Action::ClickOpen(ref r) if r == "on"
+        ));
+        assert!(matches!(commands::parse("mouse off", &cmds), commands::Action::ClickOpen(_)));
+
+        let dir = std::env::temp_dir().join("silver_click_open_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let f1 = dir.join("main.txt");
+        let f2 = dir.join("other.txt");
+        std::fs::write(&f1, "aaa\n").unwrap();
+        std::fs::write(&f2, "bbb\n").unwrap();
+        let b1 = Buffer::open(&f1).unwrap();
+        let mut app = App::test_editor(dir, vec![b1]);
+
+        app.toggle_files_panel();
+        let idx = {
+            let ed = app.editor.as_ref().unwrap();
+            let files = ed.files.as_ref().unwrap();
+            files.entries.iter().position(|e| e.path == f2).unwrap()
+        };
+        app.editor.as_mut().unwrap().files.as_mut().unwrap().selected = idx;
+
+        // Default (off): activating a file copies its path, nothing opens.
+        app.files_activate();
+        {
+            let ed = app.editor.as_ref().unwrap();
+            assert_eq!(ed.pending_path.as_deref(), Some(f2.as_path()));
+            assert!(ed.files.is_some(), "panel stays open in command mode");
+            let tabs: usize = ed.panes.iter().map(|p| p.tabs.len()).sum();
+            assert_eq!(tabs, 1);
+        }
+
+        // Toggled on: the same activation opens the file directly.
+        app.config.open_on_click = true;
+        app.files_activate();
+        let ed = app.editor.as_ref().unwrap();
+        assert!(ed.files.is_none(), "panel closes once the file opens");
+        let tabs: usize = ed.panes.iter().map(|p| p.tabs.len()).sum();
+        assert_eq!(tabs, 2);
+        assert!(ed.panes.iter().any(|p| p.tabs.iter().any(|b| b.path == f2)));
     }
 }

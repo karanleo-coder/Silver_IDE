@@ -46,6 +46,7 @@ It's built around one idea: **your RAM belongs to your programs, not your editor
 - 🖱️ Mouse everywhere — click to place the cursor, drag tabs to split, scroll with the wheel (in the TUI too)
 - 🌫️ Popups blur the background so you always know what's focused
 - 🎛️ **Everything is remappable** — shortcut keys *and* terminal command words, from a built-in panel; saved to a simple `config.toml`
+- 🖱️ **Open files your way** — by default, picking a file in the files panel copies its path for `open`; run `click on` to open files the moment you click (or press enter on) them instead — the terminal still works exactly the same either way
 - 🐈 **A cat** — it blinks, snacks on sushi, watches your cursor, and sings along when music is actually playing on your machine (silver checks)
 
 ---
@@ -180,6 +181,7 @@ start                # open the editor there (or: start <path>)
 | `break` | toggle a stop point on the cursor's line (aliases: `bp`, `stop`) |
 | `debug` | run under a debugger, stopping at your stop points (aliases: `dbg`) |
 | `keys` | view & edit shortcut keys *and* command words |
+| `click on` / `click off` | open files by clicking (or pressing enter on) them in the files panel, instead of copying the path (aliases: `mouse`) |
 | `cat name <name>` / `cat color <color>` | your cat, your rules (`pink`, `#ff79c6`, …) |
 | `theme <color>` | accent color |
 | `cursor <style>` | `block` · `bar` · `underline` · `hollow`, plus `cursor blink on/off` |
@@ -210,6 +212,8 @@ Conflicts are refused with a friendly message, `d` restores any default, and eve
 - Windows: `%APPDATA%\silver\silver-cli\config\config.toml`
 
 ```toml
+open_on_click = true     # click (or enter) a file in the panel to open it directly
+
 [cat]
 name = "Miso"
 color = "#ff79c6"

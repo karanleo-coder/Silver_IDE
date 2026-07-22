@@ -73,6 +73,12 @@ pub struct Config {
     /// e.g. "spawn" = "t". Also editable in config.toml.
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    /// When true, clicking (or pressing enter on) a file in the files
+    /// panel opens it directly. When false — the default — picking a
+    /// file copies its path for the terminal's `open` command. The
+    /// `open` command works either way.
+    #[serde(default)]
+    pub open_on_click: bool,
 }
 
 impl Default for Config {
@@ -83,6 +89,7 @@ impl Default for Config {
             recents: Vec::new(),
             keys: default_keys(),
             commands: default_commands(),
+            open_on_click: false,
         }
     }
 }
@@ -107,6 +114,7 @@ pub fn default_commands() -> BTreeMap<String, String> {
         ("check", "check"),
         ("debug", "debug"),
         ("break", "break"),
+        ("click", "click"),
     ] {
         m.insert(action.to_string(), word.to_string());
     }

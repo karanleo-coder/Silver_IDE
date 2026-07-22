@@ -851,11 +851,13 @@ fn draw_files_panel(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(Span::styled("  (empty folder)", Style::new().fg(dim))));
     }
     f.render_widget(Paragraph::new(lines), list_a);
+    let hint = if app.config.open_on_click {
+        " click/enter: open · esc: close"
+    } else {
+        " enter: expand / copy path · esc: close"
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " enter: expand / copy path · esc: close",
-            Style::new().fg(dim),
-        ))),
+        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(dim)))),
         hint_a,
     );
     app.mouse_targets.push(crate::app::MouseTarget::FilesPanel { area: list_a, first: start });
@@ -893,11 +895,13 @@ fn draw_location(f: &mut Frame, app: &mut App, body: Rect) {
         lines.push(Line::from(Span::styled("  (empty folder)", Style::new().fg(dim))));
     }
     f.render_widget(Paragraph::new(lines), list_a);
+    let hint = if app.config.open_on_click {
+        " click/enter: open · bksp: up · esc"
+    } else {
+        " enter: open dir / copy path · bksp: up · esc"
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " enter: open dir / copy path · bksp: up · esc",
-            Style::new().fg(dim),
-        ))),
+        Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(dim)))),
         hint_a,
     );
     app.mouse_targets.push(crate::app::MouseTarget::Location { area: list_a, first: start });

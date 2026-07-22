@@ -31,6 +31,9 @@ pub enum Action {
     Debug,
     /// Toggle a stop point on the cursor's line.
     BreakToggle,
+    /// `click on|off` — open files by clicking them in the files panel.
+    /// No arg shows the current state.
+    ClickOpen(String),
     Unknown(String),
 }
 
@@ -51,6 +54,7 @@ fn builtin_alias(word: &str) -> Option<&'static str> {
         "lint" | "errors" => "check",
         "dbg" | "lldb" | "pdb" => "debug",
         "bp" | "stop" => "break",
+        "mouse" => "click",
         _ => return None,
     })
 }
@@ -114,6 +118,7 @@ pub fn parse(input: &str, cmds: &BTreeMap<String, String>) -> Action {
         Some("check") => Action::Check,
         Some("debug") => Action::Debug,
         Some("break") => Action::BreakToggle,
+        Some("click") => Action::ClickOpen(rest.to_lowercase()),
         _ => Action::Unknown(format!("unknown command: {input}  (try `help`)")),
     }
 }
@@ -134,6 +139,7 @@ pub fn help_lines(cmds: &BTreeMap<String, String>) -> Vec<String> {
         format!("{} toggle a stop point on the cursor's line", dots(&w("break"))),
         format!("{} run stopping at your stop points (debugger)", dots(&w("debug"))),
         format!("{} view & edit shortcut keys and commands", dots(&w("keys"))),
+        format!("{} open files by clicking them in the panel", dots(&format!("{} on|off", w("click")))),
         format!("{} rename your cat", dots(&format!("{} name <name>", w("cat")))),
         format!("{} recolor your cat (names or #hex)", dots(&format!("{} color <color>", w("cat")))),
         format!("{} change the accent color", dots(&format!("{} <color>", w("theme")))),
