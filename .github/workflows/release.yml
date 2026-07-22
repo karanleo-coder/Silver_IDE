@@ -8,6 +8,10 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Lets us test the build matrix by hand without cutting a real
+  # release — the "attach to the release" step below only runs on
+  # an actual tag push, so a manual run just builds and packages.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,14 +25,19 @@ jobs:
           - os: macos-latest
             name: silver-macos-arm64
             bin: silver_kb
+          # musl: a fully static binary with no glibc dependency, so
+          # it runs on any Linux — old Debian/Raspberry Pi OS included
+          # — instead of only distros as new as the build runner.
           - os: ubuntu-latest
             name: silver-linux-x86_64
             bin: silver_kb
+            target: x86_64-unknown-linux-musl
           # Raspberry Pi, ARM laptops/servers: a native arm64 build,
           # so the binary's format matches the machine.
           - os: ubuntu-24.04-arm
             name: silver-linux-arm64
             bin: silver_kb
+            target: aarch64-unknown-linux-musl
           - os: windows-latest
             name: silver-windows-x86_64
             bin: silver_kb.exe
@@ -41,20 +50,45 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev \
-            libxi-dev libxcursor-dev libx11-dev libgl1-mesa-dev
+            libxi-dev libxcursor-dev libx11-dev libgl1-mesa-dev musl-tools
+
+      - name: add musl target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
 
       - name: build
-        run: cargo build --release
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target ${{ matrix.target }}
+          else
+            cargo build --release
+          fi
 
       - name: package (macOS / Linux)
         if: runner.os != 'Windows'
-        run: tar -C target/release -czf ${{ matrix.name }}.tar.gz ${{ matrix.bin }}
+        run: |
+          BIN_DIR="target/release"
+          if [ -n "${{ matrix.target }}" ]; then
+            BIN_DIR="target/${{ matrix.target }}/release"
+          fi
+          tar -C "$BIN_DIR" -czf ${{ matrix.name }}.tar.gz ${{ matrix.bin }}
 
       - name: package (Windows)
         if: runner.os == 'Windows'
         run: Compress-Archive -Path target/release/${{ matrix.bin }} -DestinationPath ${{ matrix.name }}.zip
 
+      - name: upload artifact (manual test runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.zip
+          if-no-files-found: ignore
+
       - name: attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
