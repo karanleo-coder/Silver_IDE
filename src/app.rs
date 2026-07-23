@@ -3562,6 +3562,11 @@ mod tests {
         std::fs::write(&f2, "bbb\n").unwrap();
         let b1 = Buffer::open(&f1).unwrap();
         let mut app = App::test_editor(dir, vec![b1]);
+        // test_editor loads whatever config.toml really exists on this
+        // machine — force a known starting state instead of assuming
+        // the code-level default, so this test doesn't depend on
+        // whether click-to-open happens to already be on for real.
+        app.config.open_on_click = false;
 
         app.toggle_files_panel();
         let idx = {

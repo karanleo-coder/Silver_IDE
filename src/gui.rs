@@ -22,7 +22,7 @@ const BG: Color32 = Color32::from_rgb(16, 16, 20);
 const BAR_BG: Color32 = Color32::from_rgb(24, 24, 31);
 const TICK: Duration = Duration::from_millis(120);
 
-pub fn run() -> eframe::Result {
+pub fn run() -> Result<(), String> {
     // The silver logo, pre-baked to raw pixels at build time — the
     // window/taskbar icon on every OS, no image decoder needed.
     let icon = egui::IconData {
@@ -38,7 +38,51 @@ pub fn run() -> eframe::Result {
             .with_min_inner_size([560.0, 380.0]),
         ..Default::default()
     };
-    eframe::run_native("silver", options, Box::new(|_cc| Ok(Box::new(Gui::new()))))
+    // On Linux especially, a missing runtime graphics library (X11,
+    // Wayland, GL) makes winit *panic* rather than return an Err — a
+    // raw backtrace with no idea what to do about it. Catch that so
+    // main can show one clean, actionable line instead.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native("silver", options, Box::new(|_cc| Ok(Box::new(Gui::new()))))
+    }));
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(explain_gui_failure(&e.to_string())),
+        Err(payload) => Err(explain_gui_failure(&panic_message(payload.as_ref()))),
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "the graphics backend crashed for an unknown reason".to_string()
+    }
+}
+
+/// If the failure looks like a missing X11/Wayland/GL runtime library
+/// (common on minimal Linux installs — the build only needs the `-dev`
+/// headers, but running needs the actual `.so`s), say so plainly and
+/// name the fix, instead of leaving the user with just a raw panic.
+fn explain_gui_failure(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let missing_runtime_lib = ["xlib", "libx11", "wayland", "shared librar", "dlopen", "glx", "egl"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    if missing_runtime_lib {
+        format!(
+            "{raw}\n\n\
+             this looks like a missing graphics runtime library, not a bug in silver — \
+             the terminal IDE (`silver_kb`, no --app) still works fine.\n\
+             on Debian/Ubuntu-based Linux, try:\n\
+             \x20 sudo apt-get install -y libx11-6 libxcursor1 libxrandr2 libxi6 \\\n\
+             \x20   libxkbcommon0 libwayland-client0 libgl1"
+        )
+    } else {
+        raw.to_string()
+    }
 }
 
 struct Gui {
@@ -544,4 +588,41 @@ fn draw_header_cat(ui: &mut egui::Ui, app: &App) {
         ],
         Stroke::new(1.0, accent.gamma_multiply(0.5)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_runtime_library_gets_an_actionable_hint() {
+        let msg = explain_gui_failure("failed to load one of xlib's shared libraries");
+        assert!(msg.contains("apt-get install"), "hint missing: {msg}");
+        assert!(msg.contains("silver_kb"), "should mention the TUI fallback: {msg}");
+        // The original message is preserved, not replaced.
+        assert!(msg.starts_with("failed to load one of xlib's shared libraries"));
+    }
+
+    #[test]
+    fn unrelated_failures_are_left_alone() {
+        let msg = explain_gui_failure("some totally unrelated failure");
+        assert_eq!(msg, "some totally unrelated failure");
+    }
+
+    #[test]
+    fn a_panic_in_the_gui_backend_is_caught_not_fatal() {
+        // Simulates what run() does around eframe::run_native: a panic
+        // inside the closure must not take down the whole process, and
+        // its message must come through unchanged.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+            panic!("failed to load one of xlib's shared libraries: libX11.so.6");
+        }));
+        let result: Result<(), String> = match outcome {
+            Ok(r) => r,
+            Err(payload) => Err(explain_gui_failure(&panic_message(payload.as_ref()))),
+        };
+        let err = result.expect_err("the panic should surface as an Err, not crash the test");
+        assert!(err.contains("xlib"));
+        assert!(err.contains("apt-get install"));
+    }
 }
